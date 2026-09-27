@@ -58,12 +58,6 @@ def query(upb_id: int, tx: int) -> str:
     return ENC.report_state(dev(upb_id), ctl=(tx - 1) << 2)
 
 
-def any_tx(hex_msg: str):
-    """A message with its transmit count and checksum left out, for comparing."""
-    msg = decode(hex_msg)[1]
-    return msg._replace(tx_count=0, data=msg.data[:-1])
-
-
 class FakePim:
     """Answers like the real PIM: PA, then a device state report if asked."""
 
@@ -77,6 +71,7 @@ class FakePim:
         self.signal = "5301000200FF00"  # registers F9-FF: signal, noise floor, counts
         self.register_reads: list[str] = []
         self.deaf = set(DEAF_TO_SINGLE)  # devices that miss a message sent once
+        self.rejects: set[int] = set()  # devices whose single transmissions get PE
 
     async def handle(self, reader, writer) -> None:
         self.writer = writer
@@ -100,6 +95,10 @@ class FakePim:
             self.send("PA")
             return
         _, msg = decode(body)
+        if msg.tx_count == 0 and msg.dest_id in self.rejects and not msg.link:
+            self.received.append(body)
+            self.send("PE")  # no reply follows, and upb-lib sees no timeout
+            return
         self.send("PA")
         if msg.tx_count == 0 and msg.dest_id in self.deaf and not msg.link:
             self.received.append(body)
@@ -230,6 +229,8 @@ async def main() -> int:
             await h.wait_for("transmit counts learned",
                              lambda: h.attr("1_15_0", "tx_count") == 2 and h.attr("1_14_0", "tx_count") == 1, 8)
             h.check("vanity takes 1", h.attr("1_51_0", "tx_count") == 1, h.attr("1_51_0", "tx_count"))
+            keypad_reads = [m for m in pim.received if m in (query(KEYPAD, 1), query(KEYPAD, 2))]
+            h.check("keypad read only by its probes", keypad_reads == [query(KEYPAD, 1)] * 2, keypad_reads)
             await asyncio.sleep(0.5)
 
             # States published retained
@@ -240,10 +241,8 @@ async def main() -> int:
             h.expect_state("1_51_0", {"state": "ON"})  # relay: no brightness
             h.check("keypad not a light", not any("light/1_13" in t or "upb_1_13" in t for t in h.topics),
                     [t for t in h.topics if "1_13" in t])
-            # Keypad read at connect; B1 follows Vanity (51), which is on
-            # (it may go out before the keypad's transmit count is learned)
-            h.check("keypad LEDs set at startup",
-                    [any_tx(m) for m in pim.indicates] == [any_tx(indicate(1, True))], pim.indicates)
+            # Keypad LEDs read from its probe reply; B1 follows Vanity (51), which is on
+            h.check("keypad LEDs set at startup", pim.indicates == [indicate(1, True)], pim.indicates)
             leds = json.loads(h.topics.get("upb/keypad/1_13/leds", "{}"))
             h.check("keypad LEDs published", leds.get("synced") == ["B1", "B5", "B2"]
                     and leds.get("leds", {}).get("B1") is True, leds)
@@ -394,24 +393,32 @@ async def main() -> int:
             h.check("... and no LED fix-ups", pim.indicates == [], pim.indicates)
             h.expect_state("1_14_0", {"state": "OFF", "brightness": 0})
 
-            # A single-transmission device that stops answering goes back to 2
+            # A single-transmission device that stops answering goes back to 2,
+            # starting with upb-lib's retry of the query it missed
             pim.deaf.add(51)
+            pim.received.clear()
             await client.publish("upb/light/1_51_0/cmd", "update_status")
             await h.wait_for("timed-out device raised to 2", lambda: h.attr("1_51_0", "tx_count") == 2, 12)
-            await asyncio.sleep(5.5)  # upb-lib retries the query once more at 1
+            await h.wait_for("... and its query retried with two",
+                             lambda: pim.received == [query(51, 1), query(51, 2)], 2)
             DEV_TX[51] = 2
             LINK_TX.update({1: 2, 3: 2, 4: 2, 52: 2})
             await h.command("upb/light/1_51_0/set", {"state": "OFF"}, [ENC.goto(dev(51), 0, -1)])
             await h.command("upb/link/1_1/cmd", {"command": "activate"}, [ENC.activate_link(link(1))])
 
-            # Resync button: the keypad's LEDs, then every device once more with
-            # a single transmission first (51 now misses those too)
+            # Resync button: every device once more with a single transmission
+            # first, lights before keypads; the keypad and 51 now miss those, so
+            # they're read with two. The PIM rejects 14's (PE): no reply and no
+            # timeout, so the bridge gives up on it by itself
+            pim.deaf.add(KEYPAD)
+            pim.rejects.add(14)
             pim.received.clear()
             await client.publish("upb/cmd", json.dumps({"command": "sync"}))
-            expect = [query(KEYPAD, 1), *[query(u, 1) for u in (13, 13, 14, 14, 15)], query(15, 2),
-                      query(51, 1), query(51, 2)]
-            await h.wait_for("resync relearns", lambda: len(pim.received) >= len(expect), 8)
+            expect = [query(14, 1), query(14, 2), query(15, 1), query(15, 2), query(51, 1), query(51, 2),
+                      query(KEYPAD, 1), query(KEYPAD, 2)]  # keypads last
+            await h.wait_for("resync relearns", lambda: len(pim.received) >= len(expect), 15)
             h.check("resync messages", pim.received == expect, pim.received)
+            await h.wait_for("rejected probe -> 2", lambda: h.attr("1_14_0", "tx_count") == 2, 3)
 
             # HA birth -> discovery republished
             del h.topics["homeassistant/device/upb_1_14/config"]

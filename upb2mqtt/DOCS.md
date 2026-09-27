@@ -78,7 +78,7 @@ across restarts, since devices or the PIM may have moved.
 - A scene (link) command goes out twice if any device in the scene, or any
   keypad showing it on an LED, needs two.
 - A 1-transmission device that later misses a query goes to 2 until the next
-  full read.
+  full read, starting with the retry of that query.
 - The log lists the devices at each count after every full read, and each
   light's attributes include its `tx_count`.
 
@@ -98,6 +98,10 @@ directly, the LEDs go stale and the next press seems to do nothing.
 With `keypad_sync` on, the bridge keeps the LEDs in step:
 
 - It reads each keypad's LEDs when it connects to the PIM (and on a refresh).
+  With `tx_count: auto` that read is the keypad's transmit-count query:
+  keypads are queried after all the lights, and no LED is corrected until
+  every device has been read, so each LED is compared once against the full
+  set of states.
 - It tracks how the keypad reacts to the scene commands it hears, using the
   indicator table from the UPE file.
 - When lights change, it works out what each LED should show from the same

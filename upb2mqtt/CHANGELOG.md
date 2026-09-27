@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.1
+
+- `tx_count: auto`: keypads are no longer read separately at connect (at 2
+  transmissions, with a retry). Their transmit-count query is their LED
+  read, and one that misses it gets a single read at 2. Keypads are queried
+  after the lights, and LED corrections wait until every device has been
+  read.
+- `tx_count: auto`: when a 1-transmission device misses a query, the retry
+  of that query goes out twice too, instead of once more.
+- Fix: a light change that arrived while the bridge was republishing its
+  retained state (on connecting to the broker, or when Home Assistant came
+  online) could be lost, or overwritten with the previous state, until that
+  light changed again.
+- Fix (`tx_count: auto`): reading all devices could stop at one device, until
+  the next refresh or PIM reconnect, if the PIM rejected its
+  single-transmission query or the device sent something else (a button
+  press) while being queried. Such a query now counts as missed after 3 s.
+
 ## 0.5.0
 
 - `tx_count` now takes `1`, `2` or `auto`, and defaults to `auto`. Each time
