@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Fix: 0.3.0 and 0.3.1 failed to start (`No module named 'scenes'`); the
+  image now includes every module.
+
 ## 0.3.1
 
 - New `tx_count` option (default 2): how many times each UPB message is

@@ -46,7 +46,7 @@ from upb_lib.message import PIM_ID
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
 from scenes import ACTIVATE, Scene, plan
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")

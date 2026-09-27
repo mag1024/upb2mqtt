@@ -4,7 +4,7 @@ FROM ${BUILD_FROM}
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY upb2mqtt.py keypads.py ./
+COPY *.py ./
 
 # Run directly rather than under the base image's s6-overlay /init: s6 resets
 # the environment for CMD, which hides SUPERVISOR_TOKEN from the app.
