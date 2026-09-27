@@ -1,7 +1,8 @@
 """End-to-end test: fake PIM <-> bridge (subprocess) <-> in-process MQTT broker.
 
 Checks the exact PIM messages produced for every MQTT command, the state and
-event topics that result, keypad LED sync, and discovery republish on HA birth.
+event topics that result, light groups sent as scenes, keypad LED sync, and
+discovery republish on HA birth.
 
     pip install -r requirements.txt amqtt
     python tests/test_bridge.py
@@ -20,6 +21,9 @@ from upb_lib.message import MessageEncode, decode
 from upb_lib.util import seconds_to_rate
 
 HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE.parent))
+from keypads import parse_keypads  # noqa: E402
+
 UPE = HERE / "test_network.upe"
 PIM_PORT, MQTT_PORT = 12101, 11884
 NET = 1
@@ -47,6 +51,7 @@ class FakePim:
     def __init__(self) -> None:
         self.levels = {13: 0, 14: 40, 15: 0, 51: 100}
         self.leds = 0  # keypad LED bitmask
+        self.keypad = parse_keypads(str(UPE), {KEYPAD})[KEYPAD]  # its indicator table
         self.received: list[str] = []
         self.indicates: list[str] = []  # keypad LED traffic, kept apart from received
         self.writer: asyncio.StreamWriter | None = None
@@ -79,6 +84,7 @@ class FakePim:
             self.leds = self.leds | bit if msg.data[0] else self.leds & ~bit
             return
         self.received.append(body)
+        self.keypad_hears(msg)
         if msg.msg_id == 0x22 and not msg.link:
             self.levels[msg.dest_id] = msg.data[0]
         if msg.msg_id == 0x30 and msg.dest_id in self.levels:
@@ -86,6 +92,14 @@ class FakePim:
             level = self.levels[msg.dest_id]
             data = [self.leds] if msg.dest_id == KEYPAD else [level]  # keypads: LED bitmask
             self.send("PU" + self.report(msg.dest_id, data))
+
+    def keypad_hears(self, msg) -> None:
+        """The keypad sets its LEDs from link traffic in its indicator table."""
+        commands = {0x20: "activated", 0x21: "deactivated", 0x22: "goto"}
+        if msg.link and msg.msg_id in commands:
+            self.keypad.set_report(self.leds)
+            self.keypad.apply_link(msg.dest_id, commands[msg.msg_id], msg.data[0] if msg.data else -1)
+            self.leds = sum(1 << bit for bit, on in self.keypad.leds.items() if on)
 
     @staticmethod
     def report(src: int, data: list[int]) -> str:
@@ -96,6 +110,7 @@ class FakePim:
 
     def inject(self, hex_msg: str) -> None:
         """A message heard on the powerline (e.g. a keypad press)."""
+        self.keypad_hears(decode(hex_msg)[1])
         self.send("PU" + hex_msg)
 
 
@@ -129,6 +144,15 @@ class Harness:
             self.pim.received == expect_pim,
             f"PIM got {self.pim.received}, expected {expect_pim}",
         )
+
+    async def group(self, name: str, commands: dict[int, dict], expect_pim: list[str]) -> None:
+        """Commands to several lights at once, as HA sends for a light group."""
+        self.pim.received.clear()
+        for unit, payload in commands.items():
+            await self.client.publish(f"upb/light/1_{unit}_0/set", json.dumps(payload))
+        await asyncio.sleep(0.6)
+        self.check(name, self.pim.received == expect_pim,
+                   f"PIM got {self.pim.received}, expected {expect_pim}")
 
     def state(self, index: str) -> dict | None:
         raw = self.topics.get(f"upb/light/{index}/state")
@@ -233,6 +257,29 @@ async def main() -> int:
                             [ENC.blink(link(17), 60)])
             h.check("goto event", any(e["event_type"] == "goto" and e["brightness_pct"] == 60
                                       and e["rate"] == 3.3 for _, e in h.events), h.events)
+
+            # Light groups: a scene replaces the commands where it matches exactly
+            on, off = {"state": "ON"}, {"state": "OFF"}
+            h.events.clear()
+            await h.group("group on -> Office On", {14: on, 15: on}, [ENC.activate_link(link(20))])
+            h.expect_state("1_14_0", {"state": "ON", "brightness": 100})
+            h.expect_state("1_15_0", {"state": "ON", "brightness": 100})
+            h.check("scene event fired", [t for t, _ in h.events] == ["upb/link/1_20/event"], h.events)
+            await h.group("group off -> Common Off (lowest of two)", {14: off, 15: off},
+                          [ENC.activate_link(link(17))])
+            h.expect_state("1_15_0", {"state": "OFF", "brightness": 0})
+            await h.group("scene plus a leftover light", {51: on, 14: on, 15: on},
+                          [ENC.activate_link(link(20)), ENC.goto(dev(51), 100, -1)])
+            await h.group("level not the preset -> direct", {14: {"state": "ON", "brightness": 50}, 15: on},
+                          [ENC.goto(dev(14), 50, -1), ENC.goto(dev(15), 100, -1)])
+            await h.group("transition -> not batched", {14: {"state": "OFF", "transition": 2}, 15: off},
+                          [ENC.goto(dev(14), 0, seconds_to_rate(2)), ENC.goto(dev(15), 0, -1)])
+            h.pim.received.clear()
+            await client.publish("upb/light/1_14_0/set", json.dumps(on))
+            await client.publish("upb/light/1_14_0/cmd", "update_status")
+            await asyncio.sleep(0.6)
+            h.check("batched command goes before a later one",
+                    pim.received == [ENC.goto(dev(14), 100, -1), ENC.report_state(dev(14))], pim.received)
 
             # Powerline traffic we didn't send: keypad activates link 1
             h.events.clear()

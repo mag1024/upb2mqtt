@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Light groups: light commands arriving together (within `batch_window`,
+  default 0.15 s) are replaced by a scene activate or deactivate where a
+  scene sets exactly those lights. Fewer powerline messages, and keypad
+  LEDs follow as they do for a button press.
+
 ## 0.2.0
 
 - Keypad LED sync (`keypad_sync`, on by default): keypad LEDs, and so their

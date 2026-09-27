@@ -18,6 +18,7 @@ starts (about 1.4 s per device).
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
 | `keypad_sync` | Keep keypad LEDs in step with lights (default on). See [Keypad LEDs](#keypad-leds). |
 | `keypad_scene_match` | `all` (default) or `any`: when a multi-light scene counts as on for its LED. |
+| `batch_window` | Seconds to collect light commands before sending, default 0.15 (0 = off). See [Light groups](#light-groups). |
 | `topic_prefix` | Default `upb`. |
 | `discovery_prefix` | Default `homeassistant`. |
 | `mqtt_*` | Only needed if you don't use the Mosquitto add-on. |
@@ -72,6 +73,33 @@ LEDs are left alone if any row that turns them on is a scene with no lights
 in the UPE file (such as a gate status or keypad reset scene), or if a row
 sets them to "opposite". The add-on log lists which LEDs each keypad syncs.
 The last known LED states are published on `upb/keypad/<idx>/leds`.
+
+## Light groups
+
+Home Assistant turns a light group on or off by sending a command to each
+light, which would be one powerline message per light. Instead the bridge
+holds light commands for `batch_window` seconds. If a scene (link) in the UPE
+file does what a set of them asks, it sends one link command for them:
+
+- **activate** a scene when each of its lights is being set to that
+  scene's level (off for lights the scene turns off);
+- **deactivate** a scene when all of its lights are being turned off.
+
+Every light in the scene must be in the batch, so the scene never changes a
+light you didn't ask for. Bigger scenes are tried first, and several can be
+used for one batch. Lights no scene covers get their own commands. Keypads
+hear the scene command and update their LEDs as they would for a button
+press.
+
+For example, with the Theater group's three lights turned off, the bridge
+activates *Theater Off* instead of sending three commands. Turning the group
+on sends three commands, since no scene turns on exactly those lights.
+
+Only plain on/off/brightness commands are batched; commands with a
+transition or flash are sent at once. A scene also fires its event entity
+(`activated` / `deactivated`), just as when it is activated from HA.
+
+Lights come on at the scene's fade rate rather than their default rate.
 
 ## Replacing the `upb.*` services
 

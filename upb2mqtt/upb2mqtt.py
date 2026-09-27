@@ -10,7 +10,9 @@ Topics (prefix defaults to "upb"; <idx> is upb-lib's index, e.g. 1_14_0 / 1_17):
   <prefix>/cmd                         {"command": "sync"}
   <prefix>/light/<idx>/state           {"state": "ON", "brightness": 0-100} (retained)
   <prefix>/light/<idx>/attributes      static device info (retained)
-  <prefix>/light/<idx>/set             HA JSON light schema command
+  <prefix>/light/<idx>/set             HA JSON light schema command; commands
+                                       arriving together (a light group) are
+                                       sent as a link command where one matches
   <prefix>/light/<idx>/cmd             fade_start | fade_stop | blink | update_status
   <prefix>/link/<idx>/set              "ON" activates (HA scene)
   <prefix>/link/<idx>/cmd              activate | deactivate | goto | fade_start |
@@ -42,8 +44,9 @@ from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
 from upb_lib.message import PIM_ID
 
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
+from scenes import ACTIVATE, Scene, plan
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -67,6 +70,12 @@ def brightness_pct(payload: dict[str, Any]) -> float:
     if (brightness := payload.get("brightness")) is not None:
         return round(float(brightness) / 2.55)
     return float(payload.get("brightness_pct", 100))
+
+
+def device_level(device: UpbDevice, brightness: float) -> int:
+    """The level a device ends up at, as upb-lib clamps it (relays: 0 or 100)."""
+    level = max(0, min(100, round(brightness)))
+    return 100 if level and not device.dimmable else level
 
 
 def blink_pulses(payload: dict[str, Any]) -> int:
@@ -93,6 +102,10 @@ class Bridge:
         self.device_keypads: dict[str, set[int]] = {}  # device index -> keypads
         self.link_keypads: dict[int, set[int]] = {}  # link id -> keypads
         self.keypad_timers: dict[int, asyncio.TimerHandle] = {}
+
+        self.scenes: list[Scene] = []
+        self.batch: dict[str, tuple[UpbDevice, dict[str, Any]]] = {}  # index -> command
+        self.batch_timer: asyncio.TimerHandle | None = None
 
     # ---- topics ----------------------------------------------------------
 
@@ -163,7 +176,23 @@ class Bridge:
                     ],
                 },
             )
+        self.scenes = self._load_scenes()
         self.discovery = self._build_discovery()
+
+    def _load_scenes(self) -> list[Scene]:
+        """Links that can stand in for a batch of light commands."""
+        scenes = []
+        devices = self.pim.devices.elements
+        for link in self.pim.links.elements.values():
+            # A link that also drives something we don't model can't be used
+            if not link.devices or any(d.device_id not in devices for d in link.devices):
+                continue
+            presets = {
+                d.device_id: device_level(devices[d.device_id], d.device_level)
+                for d in link.devices
+            }
+            scenes.append(Scene(link.addr.upb_id, link.name, presets))
+        return scenes
 
     def _load_keypads(self, keypad_ids: set[int]) -> None:
         self.keypads = parse_keypads(self.opts.upe_file, keypad_ids)
@@ -510,6 +539,12 @@ class Bridge:
             LOG.warning("PIM not connected; dropping %s %s", topic, text)
             return
 
+        kind, index, leaf = parts if len(parts) == 3 else ("", "", "")
+        device = self.pim.devices.elements.get(index) if kind == "light" else None
+        if device and leaf == "set" and self._batch_light(device, payload):
+            return
+        self._flush_batch()  # anything else goes out after the batched commands
+
         if parts == ["cmd"]:
             if payload.get("command") == "sync":
                 LOG.info("Refreshing all device states")
@@ -517,8 +552,7 @@ class Bridge:
             return
         if len(parts) != 3:
             return
-        kind, index, leaf = parts
-        if kind == "light" and (device := self.pim.devices.elements.get(index)):
+        if device:
             if leaf == "set":
                 self._light_set(device, payload)
             elif leaf == "cmd":
@@ -530,6 +564,46 @@ class Bridge:
                 self._link_cmd(link, payload)
         else:
             LOG.warning("Unknown element in topic %s", topic)
+
+    def _batch_light(self, device: UpbDevice, payload: dict[str, Any]) -> bool:
+        """Hold a light command briefly, in case a group's other lights follow."""
+        if self.opts.batch_window <= 0 or "flash" in payload or "transition" in payload:
+            return False
+        self.batch.pop(device.index, None)  # a repeat replaces, and moves to the end
+        self.batch[device.index] = (device, payload)
+        if not self.batch_timer:
+            self.batch_timer = asyncio.get_running_loop().call_later(
+                self.opts.batch_window, self._flush_batch
+            )
+        return True
+
+    def _flush_batch(self) -> None:
+        """Send held light commands, as link commands where a scene matches."""
+        if self.batch_timer:
+            self.batch_timer.cancel()
+            self.batch_timer = None
+        batch, self.batch = self.batch, {}
+        if not batch:
+            return
+        if not self.pim.is_connected():
+            LOG.warning("PIM not connected; dropping commands for %s", ", ".join(batch))
+            return
+        levels = {
+            index: device_level(device, 0 if payload.get("state") == "OFF"
+                                else payload.get("brightness", 100))
+            for index, (device, payload) in batch.items()
+        }
+        chosen, rest = plan(levels, self.scenes)
+        for scene, action in chosen:
+            link = self.pim.links.elements[f"{self.pim.network_id}_{scene.link_id}"]
+            LOG.info("%d lights -> %s %s (%s)", len(scene.presets), action, link.name, link.index)
+            if action == ACTIVATE:
+                link.activate()
+            else:
+                link.deactivate()
+        for index, (device, payload) in batch.items():
+            if index in rest:
+                self._light_set(device, payload)
 
     @staticmethod
     def _light_set(device: UpbDevice, payload: dict[str, Any]) -> None:
@@ -679,6 +753,7 @@ def parse_args() -> argparse.Namespace:
         "keypad_sync": True,
         "keypad_scene_match": "all",
         "keypad_delay": 1.5,
+        "batch_window": 0.15,
         "mqtt_host": "",
         "mqtt_port": 1883,
         "mqtt_username": "",

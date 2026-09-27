@@ -22,6 +22,12 @@ configuration:
     description: >-
       When a scene with several lights counts as on for its LED: "all" when
       every light is on, "any" when at least one is.
+  batch_window:
+    name: Group batching window (seconds)
+    description: >-
+      Hold light commands this long so that a light group's commands arrive
+      together; where a scene sets exactly those lights, send the scene
+      instead. 0 disables.
   topic_prefix:
     name: Topic prefix
   discovery_prefix:

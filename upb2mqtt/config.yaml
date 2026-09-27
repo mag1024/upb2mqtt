@@ -1,5 +1,5 @@
 name: upb2mqtt
-version: "0.2.0"
+version: "0.3.0"
 slug: upb2mqtt
 description: Universal Powerline Bus (UPB) PIM to MQTT, with Home Assistant discovery
 url: https://gitea.ctl.luminal.org/mag/upb2mqtt
@@ -21,6 +21,7 @@ options:
   refresh_hours: 0
   keypad_sync: true
   keypad_scene_match: all
+  batch_window: 0.15
   topic_prefix: upb
   discovery_prefix: homeassistant
   log_level: info
@@ -30,6 +31,7 @@ schema:
   refresh_hours: int(0,168)
   keypad_sync: bool
   keypad_scene_match: list(all|any)
+  batch_window: float(0,2)
   topic_prefix: str
   discovery_prefix: str
   mqtt_host: str?
