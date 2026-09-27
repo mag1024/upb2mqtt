@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- New `tx_count` option (default 2): how many times each UPB message is
+  sent. The UPE file no longer needs a `98,tx_count=2` record; if it has
+  one, the option wins.
+
 ## 0.3.0
 
 - Light groups: light commands arriving together (within `batch_window`,

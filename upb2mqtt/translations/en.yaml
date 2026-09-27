@@ -7,6 +7,11 @@ configuration:
   upe_file:
     name: UPStart export file
     description: Path to the UPStart .upe export. The HA config folder is at /homeassistant.
+  tx_count:
+    name: Transmit count
+    description: >-
+      Send each UPB message this many times (1-4). Some devices need 2.
+      Overrides tx_count in the UPE file.
   refresh_hours:
     name: Refresh interval (hours)
     description: >-

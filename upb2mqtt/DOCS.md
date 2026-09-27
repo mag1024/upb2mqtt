@@ -15,6 +15,7 @@ starts (about 1.4 s per device).
 | --- | --- |
 | `pim_url` | Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
+| `tx_count` | Send each UPB message this many times, 1–4 (default 2; some devices need it). Overrides `tx_count` in the UPE file. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
 | `keypad_sync` | Keep keypad LEDs in step with lights (default on). See [Keypad LEDs](#keypad-leds). |
 | `keypad_scene_match` | `all` (default) or `any`: when a multi-light scene counts as on for its LED. |
@@ -24,9 +25,9 @@ starts (about 1.4 s per device).
 | `mqtt_*` | Only needed if you don't use the Mosquitto add-on. |
 | `log_level` | `debug` also turns on upb-lib's protocol logging. |
 
-upb-lib reads flags from the UPE file's `98,` record, the same way the
-integration does. `tx_count=2` makes the bridge send each message twice,
-which some devices need.
+upb-lib reads other flags (such as `use_raw_rate`) from the UPE file's `98,`
+record, the same way the integration does. An export straight from UPStart
+works as is.
 
 ## Entities
 

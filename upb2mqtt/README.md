@@ -13,6 +13,5 @@ python upb2mqtt.py --pim-url socket://10.0.5.3:2101 \
     --upe-file tests/test_network.upe --mqtt-host 127.0.0.1 --log-level debug
 ```
 
-`tests/test_network.upe` is a 4-device subset of the real network (with
-`tx_count=2`): Office Main and Office Fireplace (dimmers), Master Bath
+`tests/test_network.upe` is a 4-device subset of the real network: Office Main and Office Fireplace (dimmers), Master Bath
 Vanity (relay), and Entry KP (keypad), plus the links they belong to.

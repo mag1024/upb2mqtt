@@ -46,7 +46,7 @@ from upb_lib.message import PIM_ID
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
 from scenes import ACTIVATE, Scene, plan
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -132,6 +132,11 @@ class Bridge:
         await self.pim.load_upstart_file()
         if not self.pim.config_ok or self.pim.network_id is None:
             raise SystemExit(f"Cannot load UPStart export file {self.opts.upe_file}")
+        # The app option wins over a tx_count in the UPE file's "98," flags record
+        if self.pim.flags.get("tx_count") not in (None, self.opts.tx_count):
+            LOG.warning("Ignoring tx_count=%s in %s; using the tx_count option (%d)",
+                        self.pim.flags["tx_count"], self.opts.upe_file, self.opts.tx_count)
+        self.pim.flags["tx_count"] = self.pim.encoder.tx_count = self.opts.tx_count
         # Keypads are controllers: their presses arrive as link events, and they
         # have no load to show as a light. Dropping them also keeps upb-lib's
         # sync from querying them.
@@ -754,6 +759,7 @@ def parse_args() -> argparse.Namespace:
         "keypad_scene_match": "all",
         "keypad_delay": 1.5,
         "batch_window": 0.15,
+        "tx_count": 2,
         "mqtt_host": "",
         "mqtt_port": 1883,
         "mqtt_username": "",

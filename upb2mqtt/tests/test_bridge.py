@@ -28,7 +28,7 @@ UPE = HERE / "test_network.upe"
 PIM_PORT, MQTT_PORT = 12101, 11884
 NET = 1
 KEYPAD = 13
-ENC = MessageEncode(2)  # test_network.upe sets tx_count=2
+ENC = MessageEncode(2)  # the tx_count option's default
 
 
 def dev(upb_id: int) -> UpbAddr:
