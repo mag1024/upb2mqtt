@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- `tx_count` now takes `1`, `2` or `auto`, and defaults to `auto`. Each time
+  the bridge reads all devices (connect, *Refresh device states*,
+  `refresh_hours`) it queries every device with a single transmission first
+  (1.5 s timeout) and sends to those that answer once: a query then takes
+  about 0.8 s instead of 1.4 s. The others, and scenes containing one or
+  shown on its keypads, get 2. Nothing is persisted. The log lists the
+  devices at each count.
+- Light attributes include `tx_count`.
+
 ## 0.4.0
 
 - *Signal strength* and *Noise floor* diagnostic sensors on the UPB PIM

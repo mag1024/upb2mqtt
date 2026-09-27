@@ -10,8 +10,9 @@ configuration:
   tx_count:
     name: Transmit count
     description: >-
-      Send each UPB message this many times (1-4). Some devices need 2.
-      Overrides tx_count in the UPE file.
+      Send each UPB message this many times: 1, 2, or auto (learn which
+      devices answer a single transmission and send 2 to the rest, and to any
+      scene one of those is in). Overrides tx_count in the UPE file.
   refresh_hours:
     name: Refresh interval (hours)
     description: >-

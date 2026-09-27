@@ -40,6 +40,7 @@ from typing import Any
 
 import aiomqtt
 from upb_lib import UpbPim
+from upb_lib import connection as upb_connection
 from upb_lib.const import PimCommand, UpbCommand
 from upb_lib.devices import UpbAddr, UpbDevice
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
@@ -47,8 +48,9 @@ from upb_lib.message import PIM_ID
 
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
 from scenes import ACTIVATE, Scene, plan
+from txcount import TxCounts, TxEncoder
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -67,6 +69,15 @@ FLASH_SECONDS = {FLASH_TIME_SHORT: 0.5, FLASH_TIME_LONG: 1.5, "short": 0.5, "lon
 # serial link; nothing is sent on the powerline.
 SIGNAL_REGISTER, SIGNAL_REGISTER_COUNT = 0xF9, 7
 SIGNAL_INTERVAL = 60  # seconds between reads (also read on every PIM connect)
+
+# tx_count "auto": a device counts as answering a single transmission only if
+# it answers every one of these queries in a row; the rest get TX_AUTO_REPEAT.
+# Measured on a real PIM, replies to a single transmission arrive 0.74-0.99 s
+# after the query is sent (the query 0.35 s, the reply about as long).
+TX_PROBES = 2
+TX_PROBE_TIMEOUT = 1.5
+TX_AUTO_REPEAT = 2
+UPB_RESPONSE_TIME = upb_connection.MESSAGE_RESPONSE_TIME
 
 
 def slugify(text: str) -> str:
@@ -123,6 +134,16 @@ class Bridge:
         self.fading: dict[str, float] = {}  # device index -> loop time its fade ends
         self.signal_enabled = False
 
+        mode = str(opts.tx_count).strip().lower()
+        if mode != "auto" and mode not in ("1", "2", "3", "4"):
+            raise SystemExit(f"tx_count must be a number or auto, not {opts.tx_count!r}")
+        self.tx_auto = mode == "auto"
+        self.tx_default = TX_AUTO_REPEAT if self.tx_auto else int(mode)
+        self.tx: TxCounts | None = None
+        self.tx_names: dict[int, str] = {}  # every UPB unit, keypads included
+        self.tx_probing: tuple[int, asyncio.Future[bool]] | None = None
+        self.tx_task: asyncio.Task[None] | None = None
+
     # ---- topics ----------------------------------------------------------
 
     @property
@@ -153,18 +174,25 @@ class Bridge:
         if not self.pim.config_ok or self.pim.network_id is None:
             raise SystemExit(f"Cannot load UPStart export file {self.opts.upe_file}")
         # The app option wins over a tx_count in the UPE file's "98," flags record
-        if self.pim.flags.get("tx_count") not in (None, self.opts.tx_count):
-            LOG.warning("Ignoring tx_count=%s in %s; using the tx_count option (%d)",
+        if self.pim.flags.get("tx_count") not in (None, self.tx_default) or (
+            self.tx_auto and "tx_count" in self.pim.flags
+        ):
+            LOG.warning("Ignoring tx_count=%s in %s; using the tx_count option (%s)",
                         self.pim.flags["tx_count"], self.opts.upe_file, self.opts.tx_count)
-        self.pim.flags["tx_count"] = self.pim.encoder.tx_count = self.opts.tx_count
+        self.pim.flags["tx_count"] = self.opts.tx_count
         # Keypads are controllers: their presses arrive as link events, and they
         # have no load to show as a light. Dropping them also keeps upb-lib's
         # sync from querying them.
         devices = self.pim.devices.elements
+        for device in sorted(devices.values(), key=lambda d: d.addr.channel, reverse=True):
+            self.tx_names[device.addr.upb_id] = device.name  # channel 0's name wins
+        self.tx_names = dict(sorted(self.tx_names.items()))
         keypads = [index for index, device in devices.items() if device.isKeypad()]
         keypad_ids = {devices[index].addr.upb_id for index in keypads}
         for index in keypads:
             del devices[index]
+        all_keypads = parse_keypads(self.opts.upe_file, keypad_ids) if keypad_ids else {}
+        self._load_tx_counts(all_keypads)
         LOG.info(
             "Loaded %s: network %d, %d device channels (%d keypads skipped), "
             "%d links, flags %s",
@@ -179,18 +207,15 @@ class Bridge:
         self.pim.add_handler("connected", lambda: self._set_pim_status(True))
         self.pim.add_handler("disconnected", lambda: self._set_pim_status(False))
         self._set_pim_status(False)
-        if self.opts.keypad_sync and keypad_ids:
-            self._load_keypads(keypad_ids)
+        if self.opts.keypad_sync and all_keypads:
+            self._load_keypads(all_keypads)
         self.signal_enabled = self._watch_register_reports()
         if self.signal_enabled:
             self.pim.add_handler("connected", self._read_signal)
 
         for device in self.pim.devices.elements.values():
             device.add_callback(self._device_changed)
-            self._publish(
-                self.light_topic(device, "attributes"),
-                self._device_attributes(device),
-            )
+        self._publish_device_attributes()
         for link in self.pim.links.elements.values():
             link.add_callback(self._link_changed)
             self._publish(
@@ -222,8 +247,8 @@ class Bridge:
             scenes.append(Scene(link.addr.upb_id, link.name, presets))
         return scenes
 
-    def _load_keypads(self, keypad_ids: set[int]) -> None:
-        self.keypads = parse_keypads(self.opts.upe_file, keypad_ids)
+    def _load_keypads(self, keypads: dict[int, Keypad]) -> None:
+        self.keypads = keypads
         for upb_id, keypad in self.keypads.items():
             bits = keypad.managed_bits(lambda link_id: bool(self._members(link_id)))
             self.managed_leds[upb_id] = bits
@@ -244,18 +269,22 @@ class Bridge:
         self.pim.add_handler("connected", self._query_keypads)
         self.pim.add_handler(UpbCommand.DEVICE_STATE_REPORT.value, self._keypad_report)
 
-    @staticmethod
-    def _device_attributes(device: UpbDevice) -> dict[str, Any]:
-        return {
-            "address": device.index,
-            "upb_id": device.addr.upb_id,
-            "channel": device.addr.channel,
-            "kind": device.kind,
-            "manufacturer": device.manufacturer,
-            "product": device.product,
-            "version": device.version,
-            "dimmable": device.dimmable,
-        }
+    def _publish_device_attributes(self) -> None:
+        for device in self.pim.devices.elements.values():
+            self._publish(
+                self.light_topic(device, "attributes"),
+                {
+                    "address": device.index,
+                    "upb_id": device.addr.upb_id,
+                    "channel": device.addr.channel,
+                    "kind": device.kind,
+                    "manufacturer": device.manufacturer,
+                    "product": device.product,
+                    "version": device.version,
+                    "dimmable": device.dimmable,
+                    "tx_count": self.tx.device(device.addr.upb_id),
+                },
+            )
 
     # ---- state -> MQTT ---------------------------------------------------
 
@@ -361,6 +390,113 @@ class Bridge:
             if self.pim.is_connected():
                 self._read_signal()
 
+    # ---- transmit counts -------------------------------------------------
+
+    def _load_tx_counts(self, keypads: dict[int, Keypad]) -> None:
+        self.tx = TxCounts(self.tx_default)
+        # A link is heard by the devices in it and by keypads showing it on an LED
+        for link in self.pim.links.elements.values():
+            self.tx.add_listeners(
+                link.addr.upb_id, (int(d.device_id.split("_")[1]) for d in link.devices)
+            )
+        for upb_id, keypad in keypads.items():
+            for link_id in keypad.links():
+                self.tx.add_listeners(link_id, [upb_id])
+        self.pim.encoder = TxEncoder(self.tx.for_addr)
+        if not self.tx_auto:
+            LOG.info("Transmit count %d for every device (tx_count option)", self.tx_default)
+            return
+        # Reading each device with a single transmission first replaces upb-lib's
+        # device sync: on connect, the refresh button and every refresh_hours
+        self.pim.devices.sync = self._start_tx_probe
+        self.pim.add_handler("disconnected", self._stop_tx_probe)
+        self.pim.add_handler("timeout", self._tx_timeout)
+        self.pim.add_handler(UpbCommand.DEVICE_STATE_REPORT.value, self._tx_report)
+        # A device missing a single transmission is expected, not worth a warning
+        logging.getLogger("upb_lib.upb").addFilter(
+            lambda record: not (self.tx_probing and record.getMessage().startswith("Timeout"))
+        )
+
+    def _start_tx_probe(self) -> None:
+        self._stop_tx_probe()
+        self.tx_task = asyncio.get_running_loop().create_task(self._probe_tx())
+
+    def _stop_tx_probe(self) -> None:
+        if self.tx_task:
+            self.tx_task.cancel()
+            self.tx_task = None
+
+    async def _probe_tx(self) -> None:
+        """Read every device, learning which answer a message sent only once."""
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        LOG.info("Reading %d devices, single transmission first", len(self.tx_names))
+        devices = {d.addr.upb_id: d for d in self.pim.devices.elements.values()
+                   if d.addr.channel == 0}
+        for upb_id in self.tx_names:
+            single = True
+            for _ in range(TX_PROBES):
+                if not await self._probe_once(upb_id):
+                    single = False
+                    break
+            self.tx.single[upb_id] = single
+            if not single and (device := devices.get(upb_id)):
+                device.update_status()  # its state, at the repeat count
+        self.tx_task = None
+        self._publish_device_attributes()
+        LOG.info("Transmit counts learned in %.0f s", loop.time() - started)
+        for count, single in ((1, True), (self.tx_default, False)):
+            ids = [i for i in self.tx_names if self.tx.single.get(i) is single]
+            LOG.info("Transmit count %d, %d devices:%s", count, len(ids),
+                     "".join(f"\n  {i:3} {self.tx_names[i]}" for i in ids))
+
+    async def _probe_once(self, upb_id: int) -> bool:
+        # Wait for the PIM queue to empty: probes go after other traffic, and
+        # a command waits for at most one probe
+        # pylint: disable=protected-access
+        connection = self.pim._connection
+        while connection._write_queue:
+            await asyncio.sleep(0.1)
+        future = asyncio.get_running_loop().create_future()
+        self.tx_probing = (upb_id, future)
+        try:
+            addr = UpbAddr(self.pim.network_id, upb_id, 0)
+            # Control word 0: one transmission, no ack, no link
+            self.pim.send(self.pim.encoder.report_state(addr, ctl=0),
+                          bytearray([self.pim.network_id, upb_id]))
+            connection._write_queue[-1].retry_count = 0  # no second try
+            # upb-lib reads its response timeout when it sends; the next
+            # message must get the normal one again (see _end_probe)
+            upb_connection.MESSAGE_RESPONSE_TIME = TX_PROBE_TIMEOUT
+            return await future
+        finally:
+            self._end_probe(False)
+            self.tx_probing = None
+
+    def _end_probe(self, answered: bool) -> None:
+        upb_connection.MESSAGE_RESPONSE_TIME = UPB_RESPONSE_TIME
+        if self.tx_probing and not self.tx_probing[1].done():
+            self.tx_probing[1].set_result(answered)
+
+    def _tx_report(self, msg) -> None:
+        # A device answers with as many copies as it was sent, so a reply sent
+        # once is the answer to the probe, not to an earlier query
+        if self.tx_probing and self.tx_probing[0] == msg.src_id and not msg.link \
+                and msg.tx_count == 0:
+            self._end_probe(True)
+
+    def _tx_timeout(self, addr: bytearray | None) -> None:
+        if not addr:
+            return
+        upb_id = addr[1]
+        if self.tx_probing and self.tx_probing[0] == upb_id:
+            self._end_probe(False)
+        elif self.tx.single.get(upb_id):
+            LOG.warning("Device %d stopped answering single transmissions; now sending %d",
+                        upb_id, self.tx_default)
+            self.tx.single[upb_id] = False
+            self._publish_device_attributes()
+
     # ---- keypad LEDs -----------------------------------------------------
 
     def _link(self, link_id: int) -> Link | None:
@@ -398,6 +534,8 @@ class Bridge:
     def _keypad_report(self, msg) -> None:
         if msg.link or not msg.data or not (keypad := self.keypads.get(msg.src_id)):
             return
+        if self.tx_probing and self.tx_probing[0] == msg.src_id:
+            return  # may predate an Indicate still queued; read at connect anyway
         keypad.set_report(msg.data[0])
         LOG.debug("Keypad %s reports LEDs %02X", keypad.name, msg.data[0])
         self._publish_leds(keypad)
@@ -890,7 +1028,7 @@ def parse_args() -> argparse.Namespace:
         "keypad_scene_match": "all",
         "keypad_delay": 1.5,
         "batch_window": 0.15,
-        "tx_count": 2,
+        "tx_count": "auto",
         "mqtt_host": "",
         "mqtt_port": 1883,
         "mqtt_username": "",

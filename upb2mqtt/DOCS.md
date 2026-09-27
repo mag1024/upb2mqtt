@@ -7,7 +7,8 @@ and links to MQTT with Home Assistant discovery.
 Light states are published **retained**. When Home Assistant restarts it gets
 every state from the broker right away, without re-reading every device over
 the powerline. The bridge queries all devices only when the add-on itself
-starts (about 1.4 s per device).
+starts (about 1.4 s per device, less for devices that answer a single
+transmission; see [Transmit count](#transmit-count)).
 
 ## Configuration
 
@@ -15,7 +16,7 @@ starts (about 1.4 s per device).
 | --- | --- |
 | `pim_url` | Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
-| `tx_count` | Send each UPB message this many times, 1–4 (default 2; some devices need it). Overrides `tx_count` in the UPE file. |
+| `tx_count` | Send each UPB message this many times: `1`, `2`, or `auto` (default). See [Transmit count](#transmit-count). Overrides `tx_count` in the UPE file. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
 | `keypad_sync` | Keep keypad LEDs in step with lights (default on). See [Keypad LEDs](#keypad-leds). |
 | `keypad_scene_match` | `all` (default) or `any`: when a multi-light scene counts as on for its LED. |
@@ -55,6 +56,37 @@ works as is.
   document their units. Reading them doesn't put anything on the powerline.
 
 Entities become unavailable when the add-on or the PIM is disconnected.
+
+## Transmit count
+
+Devices on the PIM's own powerline phase hear a message sent once. Others,
+reached through the phase coupler or repeater, need it sent twice. A device
+answers a query with as many copies as it was sent, so a query sent once
+takes about 0.8 s instead of 1.4 s.
+
+With `tx_count: auto` (the default) the bridge learns which devices answer
+a single transmission each time it reads all devices: when it connects to the
+PIM, on *Refresh device states*, and every `refresh_hours`. Nothing is kept
+across restarts, since devices or the PIM may have moved.
+
+- It queries each device with a single transmission, twice. A device that
+  answers both takes 1 transmission; the reply also gives its state. One that
+  misses either (1.5 s timeout; replies take under 1 s) takes 2 and is read
+  again that way.
+- Each query waits for the PIM's queue to be idle, so a light command waits
+  behind at most one of them. Until a device has been queried, it gets 2.
+- A scene (link) command goes out twice if any device in the scene, or any
+  keypad showing it on an LED, needs two.
+- A 1-transmission device that later misses a query goes to 2 until the next
+  full read.
+- The log lists the devices at each count after every full read, and each
+  light's attributes include its `tx_count`.
+
+A full read of about 65 devices with half of them on the far phase takes about
+2.5 minutes, against about 1.5 minutes when every query is sent twice; after
+that, every query and command to a near-phase device is faster. A light
+command gets no reply, so a device that misses one isn't noticed until it
+misses a query. Set `tx_count: 2` if that matters more.
 
 ## Keypad LEDs
 
