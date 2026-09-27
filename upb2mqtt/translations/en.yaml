@@ -1,0 +1,29 @@
+configuration:
+  pim_url:
+    name: PIM
+    description: >-
+      Serial device (e.g. /dev/serial/by-id/usb-...) or network URL
+      (socket://host:port) of the UPB PIM.
+  upe_file:
+    name: UPStart export file
+    description: Path to the UPStart .upe export. The HA config folder is at /homeassistant.
+  refresh_hours:
+    name: Refresh interval (hours)
+    description: >-
+      Re-read every device's state this often, to correct drift. 0 disables.
+      Commands queue behind a refresh (about 1.4 s per device).
+  topic_prefix:
+    name: Topic prefix
+  discovery_prefix:
+    name: Discovery prefix
+  mqtt_host:
+    name: MQTT host
+    description: Leave empty to use the broker provided by the Mosquitto add-on.
+  mqtt_port:
+    name: MQTT port
+  mqtt_username:
+    name: MQTT username
+  mqtt_password:
+    name: MQTT password
+  log_level:
+    name: Log level

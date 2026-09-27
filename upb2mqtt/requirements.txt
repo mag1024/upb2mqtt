@@ -1,0 +1,2 @@
+upb-lib==0.7.2
+aiomqtt==2.5.1
