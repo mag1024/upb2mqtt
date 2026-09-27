@@ -17,6 +17,7 @@ Topics (prefix defaults to "upb"; <idx> is upb-lib's index, e.g. 1_14_0 / 1_17):
                                        fade_stop | blink
   <prefix>/link/<idx>/event            {"event_type": "activated", ...} (not retained)
   <prefix>/link/<idx>/attributes       link membership (retained)
+  <prefix>/keypad/<idx>/leds           keypad LEDs as last known (retained)
 """
 
 from __future__ import annotations
@@ -35,10 +36,14 @@ from typing import Any
 
 import aiomqtt
 from upb_lib import UpbPim
-from upb_lib.devices import UpbDevice
+from upb_lib.const import UpbCommand
+from upb_lib.devices import UpbAddr, UpbDevice
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
+from upb_lib.message import PIM_ID
 
-VERSION = "0.1.2"
+from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
+
+VERSION = "0.2.0"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -83,6 +88,12 @@ class Bridge:
         self.connected_to_broker = False
         self.discovery: dict[str, str] = {}
 
+        self.keypads: dict[int, Keypad] = {}  # upb_id -> keypad
+        self.managed_leds: dict[int, list[int]] = {}  # upb_id -> LED bits we drive
+        self.device_keypads: dict[str, set[int]] = {}  # device index -> keypads
+        self.link_keypads: dict[int, set[int]] = {}  # link id -> keypads
+        self.keypad_timers: dict[int, asyncio.TimerHandle] = {}
+
     # ---- topics ----------------------------------------------------------
 
     @property
@@ -99,6 +110,9 @@ class Bridge:
     def link_topic(self, link: Link, leaf: str) -> str:
         return f"{self.prefix}/link/{link.index}/{leaf}"
 
+    def keypad_topic(self, keypad: Keypad, leaf: str) -> str:
+        return f"{self.prefix}/keypad/{self.pim.network_id}_{keypad.upb_id}/{leaf}"
+
     # ---- setup -----------------------------------------------------------
 
     async def load(self) -> None:
@@ -110,6 +124,7 @@ class Bridge:
         # sync from querying them.
         devices = self.pim.devices.elements
         keypads = [index for index, device in devices.items() if device.isKeypad()]
+        keypad_ids = {devices[index].addr.upb_id for index in keypads}
         for index in keypads:
             del devices[index]
         LOG.info(
@@ -126,6 +141,8 @@ class Bridge:
         self.pim.add_handler("connected", lambda: self._set_pim_status(True))
         self.pim.add_handler("disconnected", lambda: self._set_pim_status(False))
         self._set_pim_status(False)
+        if self.opts.keypad_sync and keypad_ids:
+            self._load_keypads(keypad_ids)
 
         for device in self.pim.devices.elements.values():
             device.add_callback(self._device_changed)
@@ -147,6 +164,28 @@ class Bridge:
                 },
             )
         self.discovery = self._build_discovery()
+
+    def _load_keypads(self, keypad_ids: set[int]) -> None:
+        self.keypads = parse_keypads(self.opts.upe_file, keypad_ids)
+        for upb_id, keypad in self.keypads.items():
+            bits = keypad.managed_bits(lambda link_id: bool(self._members(link_id)))
+            self.managed_leds[upb_id] = bits
+            for bit in bits:
+                for link_id in keypad.on_rows(bit):
+                    link = self._link(link_id)
+                    for device_link in link.devices if link else []:
+                        self.device_keypads.setdefault(device_link.device_id, set()).add(upb_id)
+            for link_id in keypad.links():
+                self.link_keypads.setdefault(link_id, set()).add(upb_id)
+            LOG.info(
+                "Keypad %s (%d): syncing LEDs %s",
+                keypad.name,
+                upb_id,
+                ", ".join(keypad.label(bit) for bit in bits) or "none",
+            )
+        # Queued after upb-lib's own connect-time device sync
+        self.pim.add_handler("connected", self._query_keypads)
+        self.pim.add_handler(UpbCommand.DEVICE_STATE_REPORT.value, self._keypad_report)
 
     @staticmethod
     def _device_attributes(device: UpbDevice) -> dict[str, Any]:
@@ -186,6 +225,8 @@ class Bridge:
             state["brightness"] = min(status, 100)
         LOG.debug("%s (%s) -> %s", device.name, device.index, state)
         self._publish(self.light_topic(device, "state"), state)
+        for upb_id in self.device_keypads.get(device.index, ()):
+            self._schedule_keypad(upb_id)
 
     def _link_changed(self, link: Link, changeset: dict[str, Any]) -> None:
         if not (change := changeset.get("last_change")) or not change.get("command"):
@@ -198,6 +239,98 @@ class Bridge:
         }
         LOG.debug("Link %s (%s) %s", link.name, link.index, event)
         self._publish(self.link_topic(link, "event"), event, retain=False)
+        for upb_id in self.link_keypads.get(link.addr.upb_id, ()):
+            keypad = self.keypads[upb_id]
+            keypad.apply_link(link.addr.upb_id, change["command"], change.get("level", -1))
+            self._publish_leds(keypad)
+            self._schedule_keypad(upb_id)
+
+    # ---- keypad LEDs -----------------------------------------------------
+
+    def _link(self, link_id: int) -> Link | None:
+        return self.pim.links.elements.get(f"{self.pim.network_id}_{link_id}")
+
+    def _members(self, link_id: int) -> Members:
+        """(level, preset) of each light in a link; level None if unknown."""
+        members: Members = []
+        link = self._link(link_id)
+        for device_link in link.devices if link else []:
+            if device := self.pim.devices.elements.get(device_link.device_id):
+                status = device.status
+                level = status if isinstance(status, int) and status >= 0 else None
+                members.append((level, device_link.device_level))
+        return members
+
+    def _desired_led(self, keypad: Keypad, bit: int) -> bool | None:
+        """Lit if any scene that turns the LED on is active; None if unknown."""
+        states = [
+            scene_active(self._members(link_id), self.opts.keypad_scene_match)
+            for link_id in keypad.on_rows(bit)
+        ]
+        if True in states:
+            return True
+        return None if None in states else False
+
+    def _query_keypads(self) -> None:
+        for upb_id in self.keypads:
+            addr = UpbAddr(self.pim.network_id, upb_id, 0)
+            self.pim.send(
+                self.pim.encoder.report_state(addr),
+                bytearray([self.pim.network_id, upb_id]),
+            )
+
+    def _keypad_report(self, msg) -> None:
+        if msg.link or not msg.data or not (keypad := self.keypads.get(msg.src_id)):
+            return
+        keypad.set_report(msg.data[0])
+        LOG.debug("Keypad %s reports LEDs %02X", keypad.name, msg.data[0])
+        self._publish_leds(keypad)
+        self._schedule_keypad(keypad.upb_id)
+
+    def _schedule_keypad(self, upb_id: int) -> None:
+        # Let a scene finish and the keypad react to it before comparing
+        if timer := self.keypad_timers.get(upb_id):
+            timer.cancel()
+        self.keypad_timers[upb_id] = asyncio.get_running_loop().call_later(
+            self.opts.keypad_delay, self._reconcile_keypad, upb_id
+        )
+
+    def _reconcile_keypad(self, upb_id: int) -> None:
+        self.keypad_timers.pop(upb_id, None)
+        keypad = self.keypads[upb_id]
+        if not keypad.initialized or not self.pim.is_connected():
+            return  # its state report (queued on connect) will reschedule
+        addr = UpbAddr(self.pim.network_id, upb_id, 0)
+        for bit in self.managed_leds[upb_id]:
+            desired = self._desired_led(keypad, bit)
+            if desired is None or keypad.leds.get(bit) == desired:
+                continue
+            LOG.info("Keypad %s: %s LED %s", keypad.name, keypad.label(bit), "on" if desired else "off")
+            level = LEVEL_ON if desired else 0
+            # pylint: disable=protected-access
+            self.pim.send(
+                self.pim.encoder._encode_message(
+                    -1, addr, PIM_ID, INDICATE, bytearray([level, 0, bit + 1])
+                )
+            )
+            keypad.leds[bit] = desired
+        self._publish_leds(keypad)
+
+    def _publish_leds(self, keypad: Keypad) -> None:
+        if not keypad.initialized:
+            return
+        self._publish(
+            self.keypad_topic(keypad, "leds"),
+            {
+                "leds": {keypad.label(bit): state for bit, state in keypad.leds.items()
+                         if bit in keypad.labels},
+                "synced": [keypad.label(bit) for bit in self.managed_leds[keypad.upb_id]],
+            },
+        )
+
+    def _sync_all(self) -> None:
+        self.pim.devices.sync()
+        self._query_keypads()
 
     # ---- discovery -------------------------------------------------------
 
@@ -380,7 +513,7 @@ class Bridge:
         if parts == ["cmd"]:
             if payload.get("command") == "sync":
                 LOG.info("Refreshing all device states")
-                self.pim.devices.sync()
+                self._sync_all()
             return
         if len(parts) != 3:
             return
@@ -511,7 +644,7 @@ class Bridge:
             await asyncio.sleep(self.opts.refresh_hours * 3600)
             if self.pim.is_connected():
                 LOG.info("Periodic device state refresh")
-                self.pim.devices.sync()
+                self._sync_all()
 
 
 def supervisor_mqtt() -> dict[str, Any]:
@@ -543,6 +676,9 @@ def parse_args() -> argparse.Namespace:
         "topic_prefix": "upb",
         "discovery_prefix": "homeassistant",
         "refresh_hours": 0,
+        "keypad_sync": True,
+        "keypad_scene_match": "all",
+        "keypad_delay": 1.5,
         "mqtt_host": "",
         "mqtt_port": 1883,
         "mqtt_username": "",
@@ -555,7 +691,10 @@ def parse_args() -> argparse.Namespace:
         )
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     for key, value in options.items():
-        kind = type(value) if isinstance(value, (int, float)) else str
+        if isinstance(value, bool):
+            kind: Any = lambda text: text.lower() in ("1", "true", "yes", "on")
+        else:
+            kind = type(value) if isinstance(value, (int, float)) else str
         parser.add_argument(f"--{key.replace('_', '-')}", type=kind, default=value)
     return parser.parse_args()
 

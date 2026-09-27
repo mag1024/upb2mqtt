@@ -1,7 +1,7 @@
 """End-to-end test: fake PIM <-> bridge (subprocess) <-> in-process MQTT broker.
 
 Checks the exact PIM messages produced for every MQTT command, the state and
-event topics that result, and discovery republish on HA birth.
+event topics that result, keypad LED sync, and discovery republish on HA birth.
 
     pip install -r requirements.txt amqtt
     python tests/test_bridge.py
@@ -35,12 +35,20 @@ def link(link_id: int) -> LinkAddr:
     return LinkAddr(NET, link_id)
 
 
+def indicate(channel: int, on: bool) -> str:
+    """Indicate (0x26) to the keypad: set LED bit channel-1."""
+    # pylint: disable=protected-access
+    return ENC._encode_message(-1, dev(KEYPAD), 0xFF, 0x26, bytearray([0x64 if on else 0, 0, channel]))
+
+
 class FakePim:
     """Answers like the real PIM: PA, then a device state report if asked."""
 
     def __init__(self) -> None:
         self.levels = {13: 0, 14: 40, 15: 0, 51: 100}
+        self.leds = 0  # keypad LED bitmask
         self.received: list[str] = []
+        self.indicates: list[str] = []  # keypad LED traffic, kept apart from received
         self.writer: asyncio.StreamWriter | None = None
 
     async def handle(self, reader, writer) -> None:
@@ -63,15 +71,20 @@ class FakePim:
         if lead == "\x17":
             self.send("PA")
             return
-        self.received.append(body)
         _, msg = decode(body)
         self.send("PA")
+        if msg.msg_id == 0x26 and msg.dest_id == KEYPAD:
+            self.indicates.append(body)
+            bit = 1 << (msg.data[2] - 1)
+            self.leds = self.leds | bit if msg.data[0] else self.leds & ~bit
+            return
+        self.received.append(body)
         if msg.msg_id == 0x22 and not msg.link:
             self.levels[msg.dest_id] = msg.data[0]
         if msg.msg_id == 0x30 and msg.dest_id in self.levels:
             await asyncio.sleep(0.05)
             level = self.levels[msg.dest_id]
-            data = [0] if msg.dest_id == KEYPAD else [level]  # real keypads send 1 byte
+            data = [self.leds] if msg.dest_id == KEYPAD else [level]  # keypads: LED bitmask
             self.send("PU" + self.report(msg.dest_id, data))
 
     @staticmethod
@@ -141,7 +154,7 @@ async def main() -> int:
         "--pim-url", f"socket://127.0.0.1:{PIM_PORT}",
         "--upe-file", str(UPE),
         "--mqtt-host", "127.0.0.1", "--mqtt-port", str(MQTT_PORT),
-        "--log-level", "warning",
+        "--log-level", "warning", "--keypad-delay", "0.2",
     )
     try:
         async with aiomqtt.Client("127.0.0.1", MQTT_PORT) as client:
@@ -157,8 +170,13 @@ async def main() -> int:
             h.expect_state("1_14_0", {"state": "ON", "brightness": 40})
             h.expect_state("1_15_0", {"state": "OFF", "brightness": 0})
             h.expect_state("1_51_0", {"state": "ON"})  # relay: no brightness
-            h.check("keypad not published", not any("1_13" in t for t in h.topics),
+            h.check("keypad not a light", not any("light/1_13" in t or "upb_1_13" in t for t in h.topics),
                     [t for t in h.topics if "1_13" in t])
+            # Keypad read at connect; B1 follows Vanity (51), which is on
+            h.check("keypad LEDs set at startup", pim.indicates == [indicate(1, True)], pim.indicates)
+            leds = json.loads(h.topics.get("upb/keypad/1_13/leds", "{}"))
+            h.check("keypad LEDs published", leds.get("synced") == ["B1", "B5", "B2"]
+                    and leds.get("leds", {}).get("B1") is True, leds)
             h.check("discovery published", "homeassistant/device/upb_1_14/config" in h.topics)
 
             # HA JSON light commands (upb-lib default for turn_on is 100%)
@@ -227,9 +245,41 @@ async def main() -> int:
             await asyncio.sleep(0.3)
             h.expect_state("1_15_0", {"state": "ON", "brightness": 75})
 
-            # Resync button
+            # Keypad LEDs. Entry KP: B1 <- Vanity (51); B5 <- Common Off (14 and 15
+            # off); B2 <- Office On (14 and 15 on); B3 <- a reset scene, no lights.
+            async def leds_after(name: str, action, expect: list[str]) -> None:
+                pim.indicates.clear()
+                await action()
+                await asyncio.sleep(0.8)
+                h.check(name, pim.indicates == expect, f"got {pim.indicates}, expected {expect}")
+
+            async def lights(**levels: bool) -> None:
+                for unit, on in levels.items():
+                    await client.publish(f"upb/light/1_{unit[1:]}_0/set", json.dumps({"state": "ON" if on else "OFF"}))
+                await asyncio.sleep(0.1)
+
+            await lights(u51=True, u14=False, u15=False)
+            await asyncio.sleep(0.8)
+            h.check("LEDs follow lights", pim.leds == 0b011, f"{pim.leds:08b}")
+            await leds_after("light off directly -> its LED off",
+                             lambda: lights(u51=False), [indicate(1, False)])
+            # The keypad lights B2 itself for the Office On scene; only B5 is stale
+            await leds_after("scene activation -> only stale LEDs",
+                             lambda: client.publish("upb/link/1_20/set", "ON"), [indicate(2, False)])
+            await leds_after("scene_match all: one light off -> scene LED off",
+                             lambda: lights(u15=False), [indicate(3, False)])
+            await lights(u51=True)
+            await asyncio.sleep(0.8)
+
+            async def reset_heard() -> None:  # e.g. the old [kp] Cleanup automation
+                pim.inject(ENC.activate_link(link(99)))
+
+            await leds_after("reset scene heard -> managed LED restored", reset_heard, [indicate(1, True)])
+            await leds_after("unchanged lights -> no traffic", lambda: lights(u51=True), [])
+
+            # Resync button (also re-reads the keypad)
             await h.command("upb/cmd", {"command": "sync"},
-                            [ENC.report_state(dev(i)) for i in (14, 15, 51)])
+                            [ENC.report_state(dev(i)) for i in (14, 15, 51, KEYPAD)])
 
             # HA birth -> discovery republished
             del h.topics["homeassistant/device/upb_1_14/config"]

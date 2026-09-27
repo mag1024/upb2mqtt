@@ -16,6 +16,8 @@ starts (about 1.4 s per device).
 | `pim_url` | Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
+| `keypad_sync` | Keep keypad LEDs in step with lights (default on). See [Keypad LEDs](#keypad-leds). |
+| `keypad_scene_match` | `all` (default) or `any`: when a multi-light scene counts as on for its LED. |
 | `topic_prefix` | Default `upb`. |
 | `discovery_prefix` | Default `homeassistant`. |
 | `mqtt_*` | Only needed if you don't use the Mosquitto add-on. |
@@ -43,6 +45,33 @@ which some devices need.
   device states* button.
 
 Entities become unavailable when the add-on or the PIM is disconnected.
+
+## Keypad LEDs
+
+A keypad toggle button sends "on" or "off" depending on whether its LED is
+lit. The keypad changes its LEDs only when it hears a scene (link) command
+listed in its indicator table. So when Home Assistant turns lights on or off
+directly, the LEDs go stale and the next press seems to do nothing.
+
+With `keypad_sync` on, the bridge keeps the LEDs in step:
+
+- It reads each keypad's LEDs when it connects to the PIM (and on a refresh).
+- It tracks how the keypad reacts to the scene commands it hears, using the
+  indicator table from the UPE file.
+- When lights change, it works out what each LED should show from the same
+  table: an LED is lit if any scene that turns it on is active. After a
+  short pause it sets any LED that differs, with one Indicate command per
+  LED. Button presses and scene activations need no extra traffic.
+
+A scene is **active** when its lights match it: with `all`, every light it
+turns on is on (at any level) and every light it turns off is off. With
+`any`, at least one light it turns on is on. A scene that only turns lights
+off is active when all of them are off, in both modes.
+
+LEDs are left alone if any row that turns them on is a scene with no lights
+in the UPE file (such as a gate status or keypad reset scene), or if a row
+sets them to "opposite". The add-on log lists which LEDs each keypad syncs.
+The last known LED states are published on `upb/keypad/<idx>/leds`.
 
 ## Replacing the `upb.*` services
 

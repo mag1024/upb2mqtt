@@ -12,6 +12,16 @@ configuration:
     description: >-
       Re-read every device's state this often, to correct drift. 0 disables.
       Commands queue behind a refresh (about 1.4 s per device).
+  keypad_sync:
+    name: Keypad LED sync
+    description: >-
+      Keep keypad button LEDs (and so their toggle state) in step with the
+      lights their scenes control, when lights are changed directly.
+  keypad_scene_match:
+    name: Keypad scene match
+    description: >-
+      When a scene with several lights counts as on for its LED: "all" when
+      every light is on, "any" when at least one is.
   topic_prefix:
     name: Topic prefix
   discovery_prefix:
