@@ -20,8 +20,8 @@ def check(name: str, got, expected) -> None:
     FAILURES += not ok
 
 
-def result(batch: dict[str, int], scenes: list[Scene]):
-    chosen, rest = plan(batch, scenes)
+def result(batch: dict[str, int], scenes: list[Scene], current=None, shown=frozenset()):
+    chosen, rest = plan(batch, scenes, current, shown)
     return [(s.name, action) for s, action in chosen], sorted(rest)
 
 
@@ -60,6 +60,44 @@ def main() -> int:
     check("preset levels must match", result({"a": 30, "b": 60}, scenes), ([("Dim", "activate")], []))
     check("one-light scene never used", result({"vanity": 100}, scenes), ([], ["vanity"]))
     check("empty batch", result({}, scenes), ([], []))
+
+    # Lights outside the batch already at a keypad scene's level
+    all_shown = {s.link_id for s in scenes}
+    bath_dark = {"shower": 0, "vanity": 0, "sink": 0}
+    check("last light off -> off scene", result({"main": 0}, scenes, bath_dark, all_shown),
+          ([("Bath Off", "activate")], []))
+    check("not on a keypad -> direct", result({"main": 0}, scenes, bath_dark, all_shown - {4, 1, 3}),
+          ([], ["main"]))
+    check("other light on -> direct", result({"main": 0}, scenes, {**bath_dark, "sink": 100}, all_shown),
+          ([], ["main"]))
+    check("other light unknown -> direct",
+          result({"main": 0}, scenes, {"shower": 0, "vanity": 0}, all_shown), ([], ["main"]))
+    check("last light on -> on scene",
+          result({"main": 100}, scenes, {"vanity": 100, "sink": 100, "shower": 0}, all_shown),
+          ([("Bath Sink", "activate")], []))
+    check("smallest scene that covers it",
+          result({"main": 100}, scenes, {"vanity": 100, "sink": 100, "shower": 100}, all_shown),
+          ([("Bath Sink", "activate")], []))
+    check("most batch lights covered first",
+          result({"main": 0, "sink": 0}, scenes, {"vanity": 0, "shower": 0, "lamp": 100}, all_shown),
+          ([("Bath Off", "activate")], []))
+    check("exact batch match still first",
+          result({"t1": 0, "t2": 0, "t3": 0, "main": 0}, scenes, bath_dark, all_shown),
+          ([("Theater Off", "activate"), ("Bath Off", "activate")], []))
+    check("light sent by another scene isn't 'already there'",
+          result({"vanity": 0, "sink": 0, "main": 0, "shower": 100}, scenes, {}, all_shown),
+          ([("Bath Sink", "deactivate")], ["shower"]))
+    house = [f"h{i}" for i in range(1, 12)]
+    big_off = Scene(70, "House Off", dict.fromkeys(house, 0))
+    check("more than 10 lights -> direct",
+          result({"h1": 0}, [big_off], dict.fromkeys(house[1:], 0), {70}), ([], ["h1"]))
+    check("more than 10 lights, all in the batch -> scene",
+          result(dict.fromkeys(house, 0), [big_off], {}, {70}), ([("House Off", "activate")], []))
+    ten_off = Scene(71, "Ten Off", dict.fromkeys(house[:10], 0))
+    check("10 lights -> scene",
+          result({"h1": 0}, [ten_off], dict.fromkeys(house[1:10], 0), {71}), ([("Ten Off", "activate")], []))
+    check("batch level must match the preset",
+          result({"a": 50}, scenes, {"b": 60}, all_shown), ([], ["a"]))
 
     print(f"\n{FAILURES} failure(s)")
     return 1 if FAILURES else 0

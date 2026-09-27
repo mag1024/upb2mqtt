@@ -43,8 +43,16 @@ works as is.
 - **Button** *Refresh state* on each UPB device (diagnostic): re-reads the
   device's level over the powerline. Use it where you used
   `homeassistant.update_entity` with the UPB integration.
-- On the **UPB PIM** device: a *Connected* binary sensor and a *Refresh
-  device states* button.
+- On the **UPB PIM** device: a *Connected* binary sensor, a *Refresh
+  device states* button, and two diagnostic sensors read from the PIM's own
+  registers every minute:
+  - *Signal strength*: how strongly the PIM heard the last UPB message it
+    received. It changes only when a message arrives.
+  - *Noise floor*: powerline noise over the last 128 AC half-cycles, with
+    the raw counts behind it as the `noise_counts` attribute.
+
+  Both are raw PIM values (0–255, higher is stronger/noisier); PCS doesn't
+  document their units. Reading them doesn't put anything on the powerline.
 
 Entities become unavailable when the add-on or the PIM is disconnected.
 
@@ -91,6 +99,18 @@ light you didn't ask for. Bigger scenes are tried first, and several can be
 used for one batch. Lights no scene covers get their own commands. Keypads
 hear the scene command and update their LEDs as they would for a button
 press.
+
+A scene shown on a keypad, with at most 10 lights, can also stand in when
+its other lights are already where it would put them. Turning off the last light that's on in an
+"off" scene activates that scene. That's one message, and every keypad
+showing the scene updates its own LEDs, instead of a light command plus an
+Indicate per stale LED. The other lights must be known to be at the
+scene's level (not unknown, and not mid-fade from a transition the bridge
+started). When several scenes fit, the bridge picks the one covering the
+most of the lights you commanded, then an activation over a deactivation,
+then the scene with the fewest lights. The scene re-commands its other
+lights, so one whose real level differed from what upb-lib recorded moves
+to the scene's level, and the scene's event entity fires.
 
 For example, with the Theater group's three lights turned off, the bridge
 activates *Theater Off* instead of sending three commands. Turning the group

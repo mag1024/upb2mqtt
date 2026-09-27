@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- *Signal strength* and *Noise floor* diagnostic sensors on the UPB PIM
+  device, read from the PIM's registers every minute. Published on
+  `upb/pim/signal`.
+- Light commands can also be replaced by a scene of at most 10 lights shown
+  on a keypad when the scene's other lights are already at its levels, e.g.
+  turning off the last light that's on activates the keypad's "off" scene.
+  The keypads update their own LEDs, saving the Indicate commands.
+- Scene substitution for light groups and keypad LED corrections now log at
+  debug instead of info.
+
 ## 0.3.2
 
 - Fix: 0.3.0 and 0.3.1 failed to start (`No module named 'scenes'`); the

@@ -7,6 +7,8 @@ retained, so Home Assistant restarts cost no powerline traffic.
 Topics (prefix defaults to "upb"; <idx> is upb-lib's index, e.g. 1_14_0 / 1_17):
   <prefix>/status                      bridge online/offline (LWT, retained)
   <prefix>/pim/status                  PIM online/offline (retained)
+  <prefix>/pim/signal                  {"signal_strength", "noise_floor", "noise_counts"}
+                                       from the PIM's own registers (retained)
   <prefix>/cmd                         {"command": "sync"}
   <prefix>/light/<idx>/state           {"state": "ON", "brightness": 0-100} (retained)
   <prefix>/light/<idx>/attributes      static device info (retained)
@@ -38,7 +40,7 @@ from typing import Any
 
 import aiomqtt
 from upb_lib import UpbPim
-from upb_lib.const import UpbCommand
+from upb_lib.const import PimCommand, UpbCommand
 from upb_lib.devices import UpbAddr, UpbDevice
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
 from upb_lib.message import PIM_ID
@@ -46,7 +48,7 @@ from upb_lib.message import PIM_ID
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
 from scenes import ACTIVATE, Scene, plan
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -58,6 +60,13 @@ EVENT_TYPES = sorted(UPB_COMMAND_TO_ACTION_MAPPING.values())
 # HA's UPB light used for short/long flash.
 FLASH_TIME_SHORT, FLASH_TIME_LONG = 1, 2
 FLASH_SECONDS = {FLASH_TIME_SHORT: 0.5, FLASH_TIME_LONG: 1.5, "short": 0.5, "long": 1.5}
+
+# PIM setup registers (PCS PIM Description v1.7): 0xF9 signal strength of the
+# last message received, 0xFA noise floor over the last 128 half-cycles,
+# 0xFB-0xFF the raw noise counts behind it. Reading them is local to the PIM's
+# serial link; nothing is sent on the powerline.
+SIGNAL_REGISTER, SIGNAL_REGISTER_COUNT = 0xF9, 7
+SIGNAL_INTERVAL = 60  # seconds between reads (also read on every PIM connect)
 
 
 def slugify(text: str) -> str:
@@ -76,6 +85,11 @@ def device_level(device: UpbDevice, brightness: float) -> int:
     """The level a device ends up at, as upb-lib clamps it (relays: 0 or 100)."""
     level = max(0, min(100, round(brightness)))
     return 100 if level and not device.dimmable else level
+
+
+def register_read(start: int, count: int) -> str:
+    """Body of a PIM "read registers" command: start, count, checksum."""
+    return f"{start:02X}{count:02X}{-(start + count) & 0xFF:02X}"
 
 
 def blink_pulses(payload: dict[str, Any]) -> int:
@@ -106,6 +120,8 @@ class Bridge:
         self.scenes: list[Scene] = []
         self.batch: dict[str, tuple[UpbDevice, dict[str, Any]]] = {}  # index -> command
         self.batch_timer: asyncio.TimerHandle | None = None
+        self.fading: dict[str, float] = {}  # device index -> loop time its fade ends
+        self.signal_enabled = False
 
     # ---- topics ----------------------------------------------------------
 
@@ -122,6 +138,10 @@ class Bridge:
 
     def link_topic(self, link: Link, leaf: str) -> str:
         return f"{self.prefix}/link/{link.index}/{leaf}"
+
+    @property
+    def signal_topic(self) -> str:
+        return f"{self.prefix}/pim/signal"
 
     def keypad_topic(self, keypad: Keypad, leaf: str) -> str:
         return f"{self.prefix}/keypad/{self.pim.network_id}_{keypad.upb_id}/{leaf}"
@@ -161,6 +181,9 @@ class Bridge:
         self._set_pim_status(False)
         if self.opts.keypad_sync and keypad_ids:
             self._load_keypads(keypad_ids)
+        self.signal_enabled = self._watch_register_reports()
+        if self.signal_enabled:
+            self.pim.add_handler("connected", self._read_signal)
 
         for device in self.pim.devices.elements.values():
             device.add_callback(self._device_changed)
@@ -279,6 +302,65 @@ class Bridge:
             self._publish_leds(keypad)
             self._schedule_keypad(upb_id)
 
+    # ---- PIM signal / noise ----------------------------------------------
+
+    def _watch_register_reports(self) -> bool:
+        """See PIM register reports, which upb-lib reads but discards.
+
+        Wraps upb-lib's private line handler (upb-lib 0.7.2); every line still
+        goes on to upb-lib unchanged.
+        """
+        # pylint: disable=protected-access
+        connection = getattr(self.pim, "_connection", None)
+        original = getattr(connection, "_handle_pim_command", None)
+        if original is None:
+            LOG.warning("This upb-lib hides PIM register reports; no signal/noise sensors")
+            return False
+
+        async def handle(command: str, data: str) -> None:
+            if command == "PR":
+                try:
+                    self._register_report(data)
+                except Exception:  # pylint: disable=broad-except
+                    LOG.exception("Error handling PIM register report %r", data)
+            await original(command, data)
+
+        connection._handle_pim_command = handle
+        return True
+
+    def _read_signal(self) -> None:
+        self.pim.send(
+            register_read(SIGNAL_REGISTER, SIGNAL_REGISTER_COUNT),
+            command=PimCommand.READ_PIM_REGISTERS,
+        )
+
+    def _register_report(self, data: str) -> None:
+        try:
+            start, values = int(data[:2], 16), bytes.fromhex(data[2:])
+        except ValueError:
+            return
+        if start != SIGNAL_REGISTER or len(values) < SIGNAL_REGISTER_COUNT:
+            return  # e.g. upb-lib's own heartbeat read
+        LOG.debug("PIM signal %d, noise floor %d, noise counts %s",
+                  values[0], values[1], values[2:SIGNAL_REGISTER_COUNT].hex())
+        self._publish(
+            self.signal_topic,
+            {
+                "signal_strength": values[0],
+                "noise_floor": values[1],
+                "noise_counts": list(values[2:SIGNAL_REGISTER_COUNT]),
+            },
+        )
+
+    async def run_signal(self) -> None:
+        """Poll the PIM's signal/noise registers (also read on every connect)."""
+        if not self.signal_enabled:
+            return
+        while True:
+            await asyncio.sleep(SIGNAL_INTERVAL)
+            if self.pim.is_connected():
+                self._read_signal()
+
     # ---- keypad LEDs -----------------------------------------------------
 
     def _link(self, link_id: int) -> Link | None:
@@ -339,7 +421,7 @@ class Bridge:
             desired = self._desired_led(keypad, bit)
             if desired is None or keypad.leds.get(bit) == desired:
                 continue
-            LOG.info("Keypad %s: %s LED %s", keypad.name, keypad.label(bit), "on" if desired else "off")
+            LOG.debug("Keypad %s: %s LED %s", keypad.name, keypad.label(bit), "on" if desired else "off")
             level = LEVEL_ON if desired else 0
             # pylint: disable=protected-access
             self.pim.send(
@@ -407,6 +489,7 @@ class Bridge:
                     "payload_off": "offline",
                     "availability_topic": self.status_topic,
                 },
+                **(self._signal_components(bridge_id) if self.signal_enabled else {}),
                 "sync": {
                     "platform": "button",
                     "unique_id": f"{bridge_id}_sync",
@@ -513,6 +596,35 @@ class Bridge:
 
         return {topic: json.dumps(cfg) for topic, cfg in configs.items()}
 
+    def _signal_components(self, bridge_id: str) -> dict[str, dict[str, Any]]:
+        # Raw PIM units (0-255); no HA device_class fits, which would demand dB
+        common = {
+            "platform": "sensor",
+            "entity_category": "diagnostic",
+            "state_class": "measurement",
+            "state_topic": self.signal_topic,
+            **self._availability(),
+        }
+        return {
+            "signal_strength": {
+                **common,
+                "unique_id": f"{bridge_id}_signal_strength",
+                "name": "Signal strength",
+                "icon": "mdi:signal",
+                "value_template": "{{ value_json.signal_strength }}",
+            },
+            "noise_floor": {
+                **common,
+                "unique_id": f"{bridge_id}_noise_floor",
+                "name": "Noise floor",
+                "icon": "mdi:waveform",
+                "value_template": "{{ value_json.noise_floor }}",
+                "json_attributes_topic": self.signal_topic,
+                "json_attributes_template":
+                    "{{ {'noise_counts': value_json.noise_counts} | tojson }}",
+            },
+        }
+
     async def _publish_discovery(self, client: aiomqtt.Client) -> None:
         # Remove entities for elements that are no longer in the UPE file
         try:
@@ -558,6 +670,7 @@ class Bridge:
         if len(parts) != 3:
             return
         if device:
+            self._note_fade([device.index], payload)
             if leaf == "set":
                 self._light_set(device, payload)
             elif leaf == "cmd":
@@ -566,9 +679,20 @@ class Bridge:
             if leaf == "set" and text.upper() in ("ON", "ACTIVATE"):
                 link.activate()
             elif leaf == "cmd":
+                self._note_fade([d.device_id for d in link.devices], payload)
                 self._link_cmd(link, payload)
         else:
             LOG.warning("Unknown element in topic %s", topic)
+
+    def _note_fade(self, indexes: list[str], payload: dict[str, Any]) -> None:
+        """Remember lights we set fading: their recorded level isn't reached yet."""
+        seconds = payload.get("transition", payload.get("rate", -1))
+        if not isinstance(seconds, (int, float)) or seconds <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        self.fading = {i: end for i, end in self.fading.items() if end > loop.time()}
+        for index in indexes:
+            self.fading[index] = loop.time() + seconds
 
     def _batch_light(self, device: UpbDevice, payload: dict[str, Any]) -> bool:
         """Hold a light command briefly, in case a group's other lights follow."""
@@ -598,10 +722,17 @@ class Bridge:
                                 else payload.get("brightness", 100))
             for index, (device, payload) in batch.items()
         }
-        chosen, rest = plan(levels, self.scenes)
+        now = asyncio.get_running_loop().time()
+        current = {
+            index: device_level(device, device.status)
+            for index, device in self.pim.devices.elements.items()
+            if index not in levels and isinstance(device.status, int) and device.status >= 0
+            and self.fading.get(index, 0) <= now  # a scene would cut the fade short
+        }
+        chosen, rest = plan(levels, self.scenes, current, self.link_keypads.keys())
         for scene, action in chosen:
             link = self.pim.links.elements[f"{self.pim.network_id}_{scene.link_id}"]
-            LOG.info("%d lights -> %s %s (%s)", len(scene.presets), action, link.name, link.index)
+            LOG.debug("%d lights -> %s %s (%s)", len(scene.presets), action, link.name, link.index)
             if action == ACTIVATE:
                 link.activate()
             else:
@@ -809,6 +940,7 @@ async def main() -> None:
             group.create_task(bridge.run_mqtt(broker))
             group.create_task(bridge.pim.async_connect())
             group.create_task(bridge.run_refresh())
+            group.create_task(bridge.run_signal())
     except asyncio.CancelledError:
         LOG.info("Shutting down")
         bridge.pim.disconnect()

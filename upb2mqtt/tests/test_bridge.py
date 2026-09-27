@@ -55,6 +55,8 @@ class FakePim:
         self.received: list[str] = []
         self.indicates: list[str] = []  # keypad LED traffic, kept apart from received
         self.writer: asyncio.StreamWriter | None = None
+        self.signal = "5301000200FF00"  # registers F9-FF: signal, noise floor, counts
+        self.register_reads: list[str] = []
 
     async def handle(self, reader, writer) -> None:
         self.writer = writer
@@ -71,7 +73,8 @@ class FakePim:
     async def on_line(self, line: str) -> None:
         lead, body = line[0], line[1:]
         if lead == "\x12":
-            self.send("PR00FF")
+            self.register_reads.append(body)
+            self.send("PRF9" + self.signal if body.startswith("F9") else "PR00FF")
             return
         if lead == "\x17":
             self.send("PA")
@@ -203,6 +206,17 @@ async def main() -> int:
                     and leds.get("leds", {}).get("B1") is True, leds)
             h.check("discovery published", "homeassistant/device/upb_1_14/config" in h.topics)
 
+            # PIM signal/noise: read on connect, published for two diagnostic sensors
+            h.check("signal registers read on connect", "F90700" in pim.register_reads, pim.register_reads)
+            signal = json.loads(h.topics.get("upb/pim/signal", "{}"))
+            h.check("signal published", signal == {"signal_strength": 0x53, "noise_floor": 1,
+                                                   "noise_counts": [0, 2, 0, 255, 0]}, signal)
+            pim_components = json.loads(h.topics["homeassistant/device/upb_1_pim/config"])["components"]
+            sensors = {k: v for k, v in pim_components.items() if v["platform"] == "sensor"}
+            h.check("signal sensors discovered", sorted(sensors) == ["noise_floor", "signal_strength"]
+                    and all(v["entity_category"] == "diagnostic" and v["state_topic"] == "upb/pim/signal"
+                            for v in sensors.values()), sensors)
+
             # HA JSON light commands (upb-lib default for turn_on is 100%)
             await h.command("upb/light/1_15_0/set", {"state": "ON", "brightness": 50, "transition": 5},
                             [ENC.goto(dev(15), 50, seconds_to_rate(5))])
@@ -323,6 +337,19 @@ async def main() -> int:
 
             await leds_after("reset scene heard -> managed LED restored", reset_heard, [indicate(1, True)])
             await leds_after("unchanged lights -> no traffic", lambda: lights(u51=True), [])
+
+            # Last light of a keypad scene: 15 is off, so turning 14 off alone
+            # completes Common Off; the keypad sets B5 itself from the link
+            await lights(u14=True, u15=False)
+            await asyncio.sleep(0.8)
+            pim.received.clear()
+            pim.indicates.clear()
+            await client.publish("upb/light/1_14_0/set", json.dumps({"state": "OFF"}))
+            await asyncio.sleep(0.8)
+            h.check("last light off -> keypad's off scene", pim.received == [ENC.activate_link(link(17))],
+                    pim.received)
+            h.check("... and no LED fix-ups", pim.indicates == [], pim.indicates)
+            h.expect_state("1_14_0", {"state": "OFF", "brightness": 0})
 
             # Resync button (also re-reads the keypad)
             await h.command("upb/cmd", {"command": "sync"},
