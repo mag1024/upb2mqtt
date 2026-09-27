@@ -36,6 +36,9 @@ which some devices need.
   `brightness_pct` and `rate` attributes, whether the link was triggered
   from HA or from a keypad. This replaces the `upb.scene_changed` bus event.
 - **Button** "<link> deactivate", one per link. Disabled by default.
+- **Button** *Refresh state* on each UPB device (diagnostic): re-reads the
+  device's level over the powerline. Use it where you used
+  `homeassistant.update_entity` with the UPB integration.
 - On the **UPB PIM** device: a *Connected* binary sensor and a *Refresh
   device states* button.
 
@@ -51,7 +54,7 @@ on each entity, for example `1_14_0` for a light and `1_17` for a link.
 | `upb.light_fade_start` | `upb/light/<idx>/cmd` | `{"command": "fade_start", "brightness_pct": 30, "rate": 10}` |
 | `upb.light_fade_stop` | `upb/light/<idx>/cmd` | `{"command": "fade_stop"}` |
 | `upb.light_blink` | `upb/light/<idx>/cmd` | `{"command": "blink", "blink_rate": 0.5}` |
-| `homeassistant.update_entity` | `upb/light/<idx>/cmd` | `{"command": "update_status"}` |
+| `homeassistant.update_entity` | press the device's *Refresh state* button | (or `upb/light/<idx>/cmd` `{"command": "update_status"}`) |
 | `upb.link_deactivate` | `upb/link/<idx>/cmd` | `{"command": "deactivate"}` |
 | `upb.link_goto` | `upb/link/<idx>/cmd` | `{"command": "goto", "brightness_pct": 60, "rate": 3}` |
 | `upb.link_fade_start` | `upb/link/<idx>/cmd` | `{"command": "fade_start", "brightness_pct": 0, "rate": 30}` |
@@ -79,8 +82,9 @@ data:
    dashboards and automations keep working.
 3. Entity IDs you renamed by hand, and areas you assigned, belonged to the
    old integration's entities. Set them again on the new entities.
-4. Any automation that used the `upb.scene_changed` event should use the
-   link's event entity instead.
+4. Automations that watched the old scenes' `last_change` attribute, or the
+   `upb.scene_changed` event, should use an `event.received` trigger on the
+   link's event entity (`event.upb_link_<name>`) with `event_type: activated`.
 
 Requires Home Assistant 2025.10 or later (`default_entity_id` in discovery).
 

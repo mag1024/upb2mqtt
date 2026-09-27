@@ -38,7 +38,7 @@ from upb_lib import UpbPim
 from upb_lib.devices import UpbDevice
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -284,6 +284,17 @@ class Bridge:
                     "transition": dimmable,
                     **self._availability(),
                 }
+            # A state query covers every channel of the device
+            components["refresh"] = {
+                "platform": "button",
+                "unique_id": f"upb_{first.index}_refresh",
+                "name": "Refresh state",
+                "default_entity_id": f"button.{slugify(name)}_refresh_state",
+                "entity_category": "diagnostic",
+                "command_topic": self.light_topic(first, "cmd"),
+                "payload_press": json.dumps({"command": "update_status"}),
+                **self._availability(),
+            }
             configs[f"{self.disc_prefix}/device/{device_id}/config"] = {
                 "device": {
                     "identifiers": [device_id],
@@ -311,6 +322,8 @@ class Bridge:
                 "name": link.name,
                 "default_entity_id": f"scene.{slug}",
                 "command_topic": self.link_topic(link, "set"),
+                # Optional in HA's schema but read unconditionally on activation
+                "payload_on": "ON",
                 **common,
             }
             configs[f"{self.disc_prefix}/event/{base}/config"] = {

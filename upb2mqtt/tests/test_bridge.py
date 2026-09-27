@@ -184,6 +184,16 @@ async def main() -> int:
                             [ENC.blink(dev(14), 20)])  # upb-lib minimum
             await h.command("upb/light/1_14_0/cmd", "update_status", [ENC.report_state(dev(14))])
 
+            # Discovery details HA needs at runtime, and the refresh button's press
+            dev14 = json.loads(h.topics["homeassistant/device/upb_1_14/config"])
+            button = dev14["components"]["refresh"]
+            h.check("refresh button discovered", button["platform"] == "button"
+                    and button["default_entity_id"] == "button.first_floor_office_main_refresh_state", button)
+            await h.command(button["command_topic"], button["payload_press"], [ENC.report_state(dev(14))])
+            scene = json.loads(h.topics["homeassistant/scene/upb_1_50/config"])
+            h.check("scene has payload_on", scene.get("payload_on") == "ON", scene)
+            await h.command(scene["command_topic"], scene["payload_on"], [ENC.activate_link(link(50))])
+
             # Links: scene activation and every link service
             h.events.clear()
             await h.command("upb/link/1_50/set", "ON", [ENC.activate_link(link(50))])
