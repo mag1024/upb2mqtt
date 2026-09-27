@@ -38,7 +38,7 @@ from upb_lib import UpbPim
 from upb_lib.devices import UpbDevice
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -504,6 +504,7 @@ class Bridge:
 def supervisor_mqtt() -> dict[str, Any]:
     """Broker credentials from the Supervisor's MQTT service, if available."""
     if not (token := os.environ.get("SUPERVISOR_TOKEN")):
+        LOG.warning("SUPERVISOR_TOKEN not set; cannot ask the Supervisor for MQTT")
         return {}
     request = urllib.request.Request(
         "http://supervisor/services/mqtt", headers={"Authorization": f"Bearer {token}"}
