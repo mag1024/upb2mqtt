@@ -2,7 +2,8 @@
 
 Checks the exact PIM messages produced for every MQTT command, the state and
 event topics that result, light groups sent as scenes, keypad LED sync,
-learned per-device transmit counts, and discovery republish on HA birth.
+learned per-device transmit counts, per-device stats and their table page,
+and discovery republish on HA birth.
 
     pip install -r requirements.txt amqtt
     python tests/test_bridge.py
@@ -26,7 +27,7 @@ from keypads import parse_keypads  # noqa: E402
 from txcount import TxEncoder  # noqa: E402
 
 UPE = HERE / "test_network.upe"
-PIM_PORT, MQTT_PORT = 12101, 11884
+PIM_PORT, MQTT_PORT, WEB_PORT = 12101, 11884, 18099
 NET = 1
 KEYPAD = 13
 # Transmit counts once learned: 15 doesn't hear single transmissions (the
@@ -140,6 +141,18 @@ class FakePim:
         self.send("PU" + hex_msg)
 
 
+async def http_get(path: str, method: str = "GET") -> tuple[int, dict[str, str], bytes]:
+    """A request to the bridge's device table server: status, headers, body."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", WEB_PORT)
+    writer.write(f"{method} {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+    raw = await reader.read()
+    writer.close()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    lines = head.decode().split("\r\n")
+    headers = dict(line.split(": ", 1) for line in lines[1:])
+    return int(lines[0].split()[1]), headers, body
+
+
 class Harness:
     def __init__(self, client: aiomqtt.Client, pim: FakePim) -> None:
         self.client = client
@@ -190,6 +203,9 @@ class Harness:
             await asyncio.sleep(0.1)
         self.check(name, test())
 
+    def stats(self, unit: int) -> dict:
+        return json.loads(self.topics.get(f"upb/stats/1_{unit}", "{}"))
+
     def state(self, index: str) -> dict | None:
         raw = self.topics.get(f"upb/light/{index}/state")
         return json.loads(raw) if raw else None
@@ -214,7 +230,8 @@ async def main() -> int:
         "--pim-url", f"socket://127.0.0.1:{PIM_PORT}",
         "--upe-file", str(UPE),
         "--mqtt-host", "127.0.0.1", "--mqtt-port", str(MQTT_PORT),
-        "--log-level", "warning", "--keypad-delay", "0.2",
+        "--log-level", "warning", "--keypad-delay", "0.2", "--stats-interval", "1",
+        "--web-port", str(WEB_PORT),
     )
     try:
         async with aiomqtt.Client("127.0.0.1", MQTT_PORT) as client:
@@ -258,6 +275,21 @@ async def main() -> int:
             h.check("signal sensors discovered", sorted(sensors) == ["noise_floor", "signal_strength"]
                     and all(v["entity_category"] == "diagnostic" and v["state_topic"] == "upb/pim/signal"
                             for v in sensors.values()), sensors)
+
+            # Per-device stats sensor: startup reads counted, probe misses aren't timeouts
+            stats14 = json.loads(h.topics["homeassistant/device/upb_1_14/config"])["components"]["stats"]
+            h.check("stats sensor discovered", stats14["state_topic"] == "upb/stats/1_14"
+                    and stats14["state_class"] == "total_increasing"
+                    and stats14["default_entity_id"] == "sensor.first_floor_office_main_state_changes",
+                    stats14)
+            await h.wait_for("stats: startup queries answered with a latency",
+                             lambda: h.stats(14).get("queries") == 2 and h.stats(14).get("latency_ms"), 3)
+            h.check("stats: probe miss not a timeout", h.stats(15).get("queries") == 2
+                    and h.stats(15).get("timeouts") == 0, h.stats(15))
+            h.check("stats: tx_count", (h.stats(14).get("tx_count"), h.stats(15).get("tx_count")) == (1, 2),
+                    (h.stats(14), h.stats(15)))
+            h.check("stats: first reads aren't changes", h.stats(14).get("state_changes") == 0, h.stats(14))
+            h.check("stats: keypads have none", "upb/stats/1_13" not in h.topics)
 
             # HA JSON light commands (upb-lib default for turn_on is 100%)
             await h.command("upb/light/1_15_0/set", {"state": "ON", "brightness": 50, "transition": 5},
@@ -347,6 +379,11 @@ async def main() -> int:
             pim.inject(ENC.goto(dev(15), 75, -1))
             await asyncio.sleep(0.3)
             h.expect_state("1_15_0", {"state": "ON", "brightness": 75})
+            await h.wait_for("stats: keypad press and someone else's goto observed",
+                             lambda: h.stats(51).get("observed") == 1 and h.stats(15).get("observed") == 1, 2)
+            s14 = h.stats(14)
+            h.check("stats: our commands and state changes counted", s14.get("sent", 0) > 0
+                    and s14.get("sent_scene", 0) > 0 and s14.get("state_changes", 0) > 0, s14)
 
             # Keypad LEDs. Entry KP: B1 <- Vanity (51); B5 <- Common Off (14 and 15
             # off); B2 <- Office On (14 and 15 on); B3 <- a reset scene, no lights.
@@ -401,6 +438,26 @@ async def main() -> int:
             await h.wait_for("timed-out device raised to 2", lambda: h.attr("1_51_0", "tx_count") == 2, 12)
             await h.wait_for("... and its query retried with two",
                              lambda: pim.received == [query(51, 1), query(51, 2)], 2)
+            await h.wait_for("stats: missed query is a timeout",
+                             lambda: h.stats(51).get("timeouts") == 1 and h.stats(51).get("tx_count") == 2, 2)
+
+            # Device table page (HA ingress) and the JSON it reads
+            code, headers, body = await http_get("/")
+            h.check("table page served", code == 200 and headers["Content-Type"].startswith("text/html")
+                    and b"stats.json" in body, (code, headers))
+            code, headers, body = await http_get("/stats.json?t=1")
+            table = json.loads(body) if code == 200 else {}
+            rows = {r["unit"]: r for r in table.get("devices", [])}
+            h.check("table: every light unit, no keypads", sorted(rows) == [14, 15, 51], sorted(rows))
+            row = rows.get(51, {})
+            h.check("table: stats, tx_count, level", table.get("pim_connected") is True
+                    and row.get("name") == "Master Bathroom Vanity" and row.get("timeouts") == 1
+                    and row.get("tx_count") == 2 and row.get("level") == [100], row)
+            h.check("table: 404", (await http_get("/nope"))[0] == 404)
+            h.check("table: HEAD has no body", (await http_get("/", "HEAD"))[2] == b"")
+            h.check("table: GET only", (await http_get("/", "POST"))[0] == 405)
+            h.check("no panel link outside HA", "configuration_url" not in json.loads(
+                h.topics["homeassistant/device/upb_1_14/config"])["device"])
             DEV_TX[51] = 2
             LINK_TX.update({1: 2, 3: 2, 4: 2, 52: 2})
             await h.command("upb/light/1_51_0/set", {"state": "OFF"}, [ENC.goto(dev(51), 0, -1)])

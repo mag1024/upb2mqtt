@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.6.0
+
+- New diagnostic sensor *State changes* on each UPB device: how often its
+  lights changed state since the add-on started. Its attributes count what
+  the bridge sent to the device (commands, scene commands, queries), traffic
+  from anyone else that concerns it (keypad presses, local presses, other
+  controllers), and missed queries. They also give the last state query's
+  latency, when the device was last heard, and its transmit count.
+  Updated every minute on `upb/stats/<network>_<unit>` (retained).
+- Device table: the add-on's web UI (ingress, and optionally the sidebar)
+  shows every device's level and statistics in a table you can sort and
+  filter. Each UPB device's *Visit* link opens it.
+
 ## 0.5.1
 
 - `tx_count: auto`: keypads are no longer read separately at connect (at 2

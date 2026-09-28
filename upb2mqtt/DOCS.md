@@ -44,6 +44,24 @@ works as is.
 - **Button** *Refresh state* on each UPB device (diagnostic): re-reads the
   device's level over the powerline. Use it where you used
   `homeassistant.update_entity` with the UPB integration.
+- **Sensor** *State changes* on each UPB device (diagnostic,
+  `sensor.<device>_state_changes`): how often any of its lights changed
+  state since the add-on started. Its attributes are the device's traffic
+  over the same time, updated every minute:
+
+  | Attribute | Meaning |
+  | --- | --- |
+  | `sent` | Commands the bridge sent to the device (not queries). |
+  | `sent_scene` | Scene (link) commands the bridge sent that the device hears. |
+  | `queries` | State reads the bridge sent. |
+  | `observed` | Traffic from anyone else that concerns the device: a scene it hears (a keypad press), a command to it, or something it sent itself (a local press). Its answers to our queries don't count. |
+  | `timeouts` | Queries it didn't answer. Misses of the single-transmission probes (see [Transmit count](#transmit-count)) don't count. |
+  | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*, `refresh_hours`) and on *Refresh state*. |
+  | `last_heard` | When the device last sent anything. |
+  | `tx_count` | Transmit count in use for the device. |
+
+  Counts start again at 0 when the add-on restarts. The sensor is
+  `total_increasing`, so Home Assistant's statistics carry on across that.
 - On the **UPB PIM** device: a *Connected* binary sensor, a *Refresh
   device states* button, and two diagnostic sensors read from the PIM's own
   registers every minute:
@@ -56,6 +74,20 @@ works as is.
   document their units. Reading them doesn't put anything on the powerline.
 
 Entities become unavailable when the add-on or the PIM is disconnected.
+
+## Device table
+
+**Open Web UI** on the add-on's page shows every UPB device in one table:
+its current level, the *State changes* statistics above and its transmit
+count. Click a column heading to sort by it (again to reverse), and type in
+the box to filter by name, product or unit ID. The table refreshes every 5
+seconds and reads the bridge directly, so it's more current than the
+sensors.
+
+- To get it in Home Assistant's sidebar (as *UPB devices*), turn on **Show
+  in sidebar** on the add-on's page.
+- Each UPB device's page, and the UPB PIM's, has a **Visit** link to the
+  table.
 
 ## Transmit count
 

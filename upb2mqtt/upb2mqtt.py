@@ -22,6 +22,11 @@ Topics (prefix defaults to "upb"; <idx> is upb-lib's index, e.g. 1_14_0 / 1_17):
   <prefix>/link/<idx>/event            {"event_type": "activated", ...} (not retained)
   <prefix>/link/<idx>/attributes       link membership (retained)
   <prefix>/keypad/<idx>/leds           keypad LEDs as last known (retained)
+  <prefix>/stats/<net>_<upb_id>        per-device traffic counts, latency and
+                                       tx_count since the bridge started
+                                       (retained, every stats_interval)
+
+The same statistics are shown as a table on Home Assistant's ingress (web.py).
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ import os
 import re
 import signal
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,13 +50,15 @@ from upb_lib import connection as upb_connection
 from upb_lib.const import PimCommand, UpbCommand
 from upb_lib.devices import UpbAddr, UpbDevice, UpbDevices
 from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
-from upb_lib.message import PIM_ID
+from upb_lib.message import PIM_ID, decode
 
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
 from scenes import ACTIVATE, Scene, plan
+from stats import Stats
 from txcount import TxCounts, TxEncoder
+import web
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -78,6 +86,11 @@ TX_PROBES = 2
 TX_PROBE_TIMEOUT = 1.5
 TX_AUTO_REPEAT = 2
 UPB_RESPONSE_TIME = upb_connection.MESSAGE_RESPONSE_TIME
+
+# Powerline messages counted as observed traffic (see stats.py)
+HEARD_COMMANDS = (UpbCommand.ACTIVATE, UpbCommand.DEACTIVATE, UpbCommand.GOTO,
+                  UpbCommand.FADE_START, UpbCommand.FADE_STOP, UpbCommand.BLINK,
+                  UpbCommand.DEVICE_STATE_REPORT)
 
 
 def slugify(text: str) -> str:
@@ -133,6 +146,8 @@ class Bridge:
         self.batch_timer: asyncio.TimerHandle | None = None
         self.fading: dict[str, float] = {}  # device index -> loop time its fade ends
         self.signal_enabled = False
+        self.stats = Stats()
+        self.panel_url: str | None = None  # the table page in HA, for device links
 
         mode = str(opts.tx_count).strip().lower()
         if mode != "auto" and mode not in ("1", "2", "3", "4"):
@@ -167,6 +182,9 @@ class Bridge:
     def keypad_topic(self, keypad: Keypad, leaf: str) -> str:
         return f"{self.prefix}/keypad/{self.pim.network_id}_{keypad.upb_id}/{leaf}"
 
+    def stats_topic(self, upb_id: int) -> str:
+        return f"{self.prefix}/stats/{self.pim.network_id}_{upb_id}"
+
     # ---- setup -----------------------------------------------------------
 
     async def load(self) -> None:
@@ -193,6 +211,7 @@ class Bridge:
             del devices[index]
         all_keypads = parse_keypads(self.opts.upe_file, keypad_ids) if keypad_ids else {}
         self._load_tx_counts(all_keypads)
+        self._watch_traffic()
         LOG.info(
             "Loaded %s: network %d, %d device channels (%d keypads skipped), "
             "%d links, flags %s",
@@ -211,13 +230,14 @@ class Bridge:
             self._load_keypads(all_keypads)
         # Replaces upb-lib's device sync, which it runs on connect
         self.pim.devices.sync = self._read_all
-        self.signal_enabled = self._watch_register_reports()
+        self.signal_enabled = self._watch_pim_lines()
         if self.signal_enabled:
             self.pim.add_handler("connected", self._read_signal)
 
         for device in self.pim.devices.elements.values():
             device.add_callback(self._device_changed)
         self._publish_device_attributes()
+        self._publish_stats()
         for link in self.pim.links.elements.values():
             link.add_callback(self._link_changed)
             self._publish(
@@ -310,7 +330,11 @@ class Bridge:
         if device.dimmable:
             state["brightness"] = min(status, 100)
         LOG.debug("%s (%s) -> %s", device.name, device.index, state)
-        self._publish(self.light_topic(device, "state"), state)
+        topic = self.light_topic(device, "state")
+        # Changes only: not the first state read, nor a report of the same one
+        if (previous := self.retained.get(topic)) is not None and previous != json.dumps(state):
+            self.stats[device.addr.upb_id].state_changes += 1
+        self._publish(topic, state)
         for upb_id in self.device_keypads.get(device.index, ()):
             self._schedule_keypad(upb_id)
 
@@ -333,8 +357,9 @@ class Bridge:
 
     # ---- PIM signal / noise ----------------------------------------------
 
-    def _watch_register_reports(self) -> bool:
-        """See PIM register reports, which upb-lib reads but discards.
+    def _watch_pim_lines(self) -> bool:
+        """See PIM lines upb-lib reads but doesn't pass on: register reports,
+        and the PIM accepting a query (where its latency is timed from).
 
         Wraps upb-lib's private line handler (upb-lib 0.7.2); every line still
         goes on to upb-lib unchanged.
@@ -343,15 +368,18 @@ class Bridge:
         connection = getattr(self.pim, "_connection", None)
         original = getattr(connection, "_handle_pim_command", None)
         if original is None:
-            LOG.warning("This upb-lib hides PIM register reports; no signal/noise sensors")
+            LOG.warning("This upb-lib hides PIM register reports; "
+                        "no signal/noise sensors or device latency")
             return False
 
         async def handle(command: str, data: str) -> None:
-            if command == "PR":
-                try:
+            try:
+                if command == "PR":
                     self._register_report(data)
-                except Exception:  # pylint: disable=broad-except
-                    LOG.exception("Error handling PIM register report %r", data)
+                elif command == "PA" and (awaiting := connection._awaiting_response_command):
+                    self.stats.accepted(awaiting[1])
+            except Exception:  # pylint: disable=broad-except
+                LOG.exception("Error handling PIM line %s%r", command, data)
             await original(command, data)
 
         connection._handle_pim_command = handle
@@ -389,6 +417,81 @@ class Bridge:
             await asyncio.sleep(SIGNAL_INTERVAL)
             if self.pim.is_connected():
                 self._read_signal()
+
+    # ---- device statistics -----------------------------------------------
+
+    def _watch_traffic(self) -> None:
+        """Count what the bridge sends and what it hears, per device."""
+        self.stats.link_members = self.tx.link_listeners
+        send = self.pim.send  # upb-lib's elements send through this too
+
+        def counted_send(msg, rsp=None, command=PimCommand.TX_UPB_MSG):
+            if command == PimCommand.TX_UPB_MSG:
+                self.stats.sent(decode(msg)[1])
+            send(msg, rsp, command)
+
+        self.pim.send = counted_send
+        for command in HEARD_COMMANDS:
+            self.pim.add_handler(command.value, self.stats.heard)
+        self.pim.add_handler("timeout", self._stats_timeout)
+        self.pim.add_handler("disconnected", self.stats.disconnected)
+
+    def _stats_timeout(self, addr: bytearray | None) -> None:
+        if addr:
+            # A device missing a single-transmission probe isn't a fault
+            probe = bool(self.tx_probing and self.tx_probing[0] == addr[1])
+            self.stats.timed_out(addr[1], count=not probe)
+
+    def _units(self) -> dict[int, list[UpbDevice]]:
+        """Each UPB device's lights (one per channel), by unit id."""
+        units: dict[int, list[UpbDevice]] = {}
+        for device in self.pim.devices.elements.values():
+            units.setdefault(device.addr.upb_id, []).append(device)
+        return dict(sorted(units.items()))
+
+    @staticmethod
+    def _unit_name(channels: list[UpbDevice]) -> str:
+        """A multi-channel device's name, without its channel number."""
+        first = channels[0]
+        if len(channels) > 1 and first.name.endswith(f" {first.addr.channel}"):
+            return first.name.rsplit(" ", 1)[0]
+        return first.name
+
+    def status(self) -> dict[str, Any]:
+        """Everything the device table shows (web.py)."""
+        return {
+            "pim_connected": self.pim.is_connected(),
+            "since": datetime.fromtimestamp(self.stats.started, timezone.utc).isoformat(),
+            "tx_count": str(self.opts.tx_count),
+            "devices": [
+                {
+                    "unit": upb_id,
+                    "name": self._unit_name(channels),
+                    "product": channels[0].product,
+                    "level": [d.status if isinstance(d.status, int) and d.status >= 0 else None
+                              for d in sorted(channels, key=lambda d: d.addr.channel)],
+                    **self.stats[upb_id].as_dict(),
+                    "tx_count": self.tx.device(upb_id),
+                }
+                for upb_id, channels in self._units().items()
+            ],
+        }
+
+    def _publish_stats(self) -> None:
+        for upb_id in self._units():
+            self._publish(
+                self.stats_topic(upb_id),
+                {**self.stats[upb_id].as_dict(), "tx_count": self.tx.device(upb_id)},
+            )
+
+    async def run_web(self) -> None:
+        if self.opts.web_port:
+            await web.serve(self.opts.web_port, self.status)
+
+    async def run_stats(self) -> None:
+        while True:
+            await asyncio.sleep(self.opts.stats_interval)
+            self._publish_stats()
 
     # ---- transmit counts -------------------------------------------------
 
@@ -614,6 +717,10 @@ class Bridge:
     def _origin(self) -> dict[str, str]:
         return {"name": "upb2mqtt", "sw_version": VERSION}
 
+    def _panel_link(self) -> dict[str, str]:
+        """A device page's "Visit" link, to the device table."""
+        return {"configuration_url": self.panel_url} if self.panel_url else {}
+
     def _bridge_device_id(self) -> str:
         return f"upb_{self.pim.network_id}_pim"
 
@@ -630,6 +737,7 @@ class Bridge:
                 "manufacturer": "Powerline Control Systems",
                 "model": "PIM",
                 "sw_version": VERSION,
+                **self._panel_link(),
             },
             "origin": self._origin(),
             "components": {
@@ -658,16 +766,11 @@ class Bridge:
         }
 
         # One HA device per UPB device; one light per channel
-        by_upb_id: dict[int, list[UpbDevice]] = {}
-        for device in self.pim.devices.elements.values():
-            by_upb_id.setdefault(device.addr.upb_id, []).append(device)
-        for upb_id, channels in by_upb_id.items():
+        for upb_id, channels in self._units().items():
             first = channels[0]
             multi = len(channels) > 1
             device_id = f"upb_{self.pim.network_id}_{upb_id}"
-            name = first.name
-            if multi and name.endswith(f" {first.addr.channel}"):
-                name = name.rsplit(" ", 1)[0]
+            name = self._unit_name(channels)
             components = {}
             for device in channels:
                 dimmable = bool(device.dimmable)
@@ -700,6 +803,19 @@ class Bridge:
                 "payload_press": json.dumps({"command": "update_status"}),
                 **self._availability(),
             }
+            components["stats"] = {
+                "platform": "sensor",
+                "unique_id": f"{device_id}_stats",
+                "name": "State changes",
+                "default_entity_id": f"sensor.{slugify(name)}_state_changes",
+                "entity_category": "diagnostic",
+                "state_class": "total_increasing",
+                "icon": "mdi:counter",
+                "state_topic": self.stats_topic(upb_id),
+                "value_template": "{{ value_json.state_changes }}",
+                "json_attributes_topic": self.stats_topic(upb_id),
+                **self._availability(),
+            }
             configs[f"{self.disc_prefix}/device/{device_id}/config"] = {
                 "device": {
                     "identifiers": [device_id],
@@ -708,6 +824,7 @@ class Bridge:
                     "model": first.product,
                     "sw_version": first.version,
                     "via_device": bridge_id,
+                    **self._panel_link(),
                 },
                 "origin": self._origin(),
                 "components": components,
@@ -1013,17 +1130,31 @@ class Bridge:
                 self._read_all()
 
 
+def supervisor_get(path: str) -> dict[str, Any]:
+    """GET from the Supervisor API; raises if there's none (not an add-on)."""
+    if not (token := os.environ.get("SUPERVISOR_TOKEN")):
+        raise LookupError("SUPERVISOR_TOKEN not set")
+    request = urllib.request.Request(
+        f"http://supervisor{path}", headers={"Authorization": f"Bearer {token}"}
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.load(response)["data"]
+
+
+def supervisor_panel_url() -> str | None:
+    """This add-on's ingress panel, as a link HA opens in its own UI."""
+    try:
+        info = supervisor_get("/addons/self/info")
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.info("No ingress panel link for devices (%s)", err)
+        return None
+    return f"homeassistant://hassio/ingress/{info['slug']}" if info.get("ingress") else None
+
+
 def supervisor_mqtt() -> dict[str, Any]:
     """Broker credentials from the Supervisor's MQTT service, if available."""
-    if not (token := os.environ.get("SUPERVISOR_TOKEN")):
-        LOG.warning("SUPERVISOR_TOKEN not set; cannot ask the Supervisor for MQTT")
-        return {}
-    request = urllib.request.Request(
-        "http://supervisor/services/mqtt", headers={"Authorization": f"Bearer {token}"}
-    )
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            data = json.load(response)["data"]
+        data = supervisor_get("/services/mqtt")
     except Exception as err:  # pylint: disable=broad-except
         LOG.warning("No MQTT service from Supervisor (%s)", err)
         return {}
@@ -1045,6 +1176,8 @@ def parse_args() -> argparse.Namespace:
         "keypad_sync": True,
         "keypad_scene_match": "all",
         "keypad_delay": 1.5,
+        "stats_interval": 60,
+        "web_port": 8099,  # config.yaml's ingress_port; 0 = no device table
         "batch_window": 0.15,
         "tx_count": "auto",
         "mqtt_host": "",
@@ -1084,6 +1217,7 @@ async def main() -> None:
         raise SystemExit("No MQTT broker: install the Mosquitto add-on or set mqtt_host")
 
     bridge = Bridge(opts)
+    bridge.panel_url = supervisor_panel_url()
     await bridge.load()
 
     main_task = asyncio.current_task()
@@ -1097,6 +1231,8 @@ async def main() -> None:
             group.create_task(bridge.pim.async_connect())
             group.create_task(bridge.run_refresh())
             group.create_task(bridge.run_signal())
+            group.create_task(bridge.run_stats())
+            group.create_task(bridge.run_web())
     except asyncio.CancelledError:
         LOG.info("Shutting down")
         bridge.pim.disconnect()
