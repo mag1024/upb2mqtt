@@ -438,8 +438,9 @@ async def main() -> int:
             await h.wait_for("timed-out device raised to 2", lambda: h.attr("1_51_0", "tx_count") == 2, 12)
             await h.wait_for("... and its query retried with two",
                              lambda: pim.received == [query(51, 1), query(51, 2)], 2)
-            await h.wait_for("stats: missed query is a timeout",
-                             lambda: h.stats(51).get("timeouts") == 1 and h.stats(51).get("tx_count") == 2, 2)
+            await h.wait_for("stats: query answered on retry isn't a timeout",
+                             lambda: h.stats(51).get("queries") == 3 and h.stats(51).get("timeouts") == 0
+                             and h.stats(51).get("tx_count") == 2, 2)
 
             # Device table page (HA ingress) and the JSON it reads
             code, headers, body = await http_get("/")
@@ -451,8 +452,15 @@ async def main() -> int:
             h.check("table: every light unit, no keypads", sorted(rows) == [14, 15, 51], sorted(rows))
             row = rows.get(51, {})
             h.check("table: stats, tx_count, level", table.get("pim_connected") is True
-                    and row.get("name") == "Master Bathroom Vanity" and row.get("timeouts") == 1
+                    and row.get("name") == "Master Bathroom Vanity" and row.get("timeouts") == 0
                     and row.get("tx_count") == 2 and row.get("level") == [100], row)
+            pim.received.clear()
+            code = (await http_get("/refresh/14", "POST"))[0]
+            await asyncio.sleep(0.3)
+            h.check("table: refresh icon reads the device", code == 202
+                    and pim.received == [ENC.report_state(dev(14))], (code, pim.received))
+            h.check("table: refresh unknown device", (await http_get("/refresh/13", "POST"))[0] == 404)
+            h.check("table: refresh needs POST", (await http_get("/refresh/14"))[0] == 405)
             h.check("table: 404", (await http_get("/nope"))[0] == 404)
             h.check("table: HEAD has no body", (await http_get("/", "HEAD"))[2] == b"")
             h.check("table: GET only", (await http_get("/", "POST"))[0] == 405)

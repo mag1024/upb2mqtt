@@ -58,7 +58,7 @@ from stats import Stats
 from txcount import TxCounts, TxEncoder
 import web
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -437,10 +437,16 @@ class Bridge:
         self.pim.add_handler("disconnected", self.stats.disconnected)
 
     def _stats_timeout(self, addr: bytearray | None) -> None:
-        if addr:
-            # A device missing a single-transmission probe isn't a fault
-            probe = bool(self.tx_probing and self.tx_probing[0] == addr[1])
-            self.stats.timed_out(addr[1], count=not probe)
+        if not addr:
+            return
+        # upb-lib notifies before using up the query's retry: one left means
+        # it goes out again
+        # pylint: disable=protected-access
+        queue = self.pim._connection._write_queue
+        retrying = bool(queue) and queue[0].retry_count > 0
+        # A device missing a single-transmission probe isn't a fault
+        probe = bool(self.tx_probing and self.tx_probing[0] == addr[1])
+        self.stats.timed_out(addr[1], retrying, probe)
 
     def _units(self) -> dict[int, list[UpbDevice]]:
         """Each UPB device's lights (one per channel), by unit id."""
@@ -484,9 +490,17 @@ class Bridge:
                 {**self.stats[upb_id].as_dict(), "tx_count": self.tx.device(upb_id)},
             )
 
+    def refresh_unit(self, upb_id: int) -> bool:
+        """Read a device's state now (the table's refresh icon)."""
+        channels = self._units().get(upb_id)
+        if not channels or not self.pim.is_connected():
+            return False
+        channels[0].update_status()  # one query answers for every channel
+        return True
+
     async def run_web(self) -> None:
         if self.opts.web_port:
-            await web.serve(self.opts.web_port, self.status)
+            await web.serve(self.opts.web_port, self.status, self.refresh_unit)
 
     async def run_stats(self) -> None:
         while True:

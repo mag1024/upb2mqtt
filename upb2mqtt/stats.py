@@ -9,7 +9,8 @@ again (Home Assistant's total_increasing sensors expect exactly that).
 - observed: powerline traffic from anyone else that concerns the device: a
   link it hears, a message to it, or a message it sent itself (a local
   press), other than its reply to our query.
-- timeouts: queries it didn't answer (tx_count probes excepted).
+- timeouts: queries it never answered, upb-lib's retry included (tx_count
+  probes, which aren't retried, don't count).
 - latency: of the last query, from the PIM accepting it (PA, so queue waits
   don't count) to the device's state report. Only queries are timed, so a
   reading comes from each read of all devices or a Refresh state press.
@@ -86,10 +87,11 @@ class Stats:
         """The PIM accepted a query to the device and is waiting for its reply."""
         self.pending = (upb_id, self.clock())
 
-    def timed_out(self, upb_id: int, count: bool = True) -> None:
+    def timed_out(self, upb_id: int, retrying: bool, probe: bool = False) -> None:
+        """An attempt at a query went unanswered; upb-lib may send it again."""
         if self.pending and self.pending[0] == upb_id:
             self.pending = None
-        if count:
+        if not retrying and not probe:
             self[upb_id].timeouts += 1
 
     def disconnected(self) -> None:

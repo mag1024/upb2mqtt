@@ -55,7 +55,7 @@ works as is.
   | `sent_scene` | Scene (link) commands the bridge sent that the device hears. |
   | `queries` | State reads the bridge sent. |
   | `observed` | Traffic from anyone else that concerns the device: a scene it hears (a keypad press), a command to it, or something it sent itself (a local press). Its answers to our queries don't count. |
-  | `timeouts` | Queries it didn't answer. Misses of the single-transmission probes (see [Transmit count](#transmit-count)) don't count. |
+  | `timeouts` | Queries it never answered. An unanswered query is sent once more; only when that goes unanswered too does it count. Misses of the single-transmission probes (see [Transmit count](#transmit-count)) are expected and don't count. |
   | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*, `refresh_hours`) and on *Refresh state*. |
   | `last_heard` | When the device last sent anything. |
   | `tx_count` | Transmit count in use for the device. |
@@ -83,6 +83,11 @@ count. Click a column heading to sort by it (again to reverse), and type in
 the box to filter by name, product or unit ID. The table refreshes every 5
 seconds and reads the bridge directly, so it's more current than the
 sensors.
+
+The refresh icon beside a device's name reads its state over the powerline
+now, the same as its *Refresh state* button. It spins until the device
+answers, then turns green, or red if the device didn't answer (the query
+and its retry take up to about 10 s).
 
 - To get it in Home Assistant's sidebar (as *UPB devices*), turn on **Show
   in sidebar** on the add-on's page.

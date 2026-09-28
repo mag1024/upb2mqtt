@@ -36,12 +36,13 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: auto; max-height: calc(100vh - 90px); }
   table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
-  th:first-child, td:first-child { text-align: left; position: sticky; left: 0; background: inherit; }
+  th:first-child, td:first-child { text-align: left; position: sticky; left: 0; z-index: 1; }
+  tbody td:first-child { background: inherit; }  /* the row's, hover included */
   thead th {
     position: sticky; top: 0; z-index: 1; background: var(--head); font-weight: 500;
     cursor: pointer; user-select: none;
   }
-  thead th:first-child { z-index: 2; }
+  thead th:first-child, tfoot td:first-child { z-index: 3; }
   thead th:hover { color: var(--accent); }
   thead th[aria-sort] { color: var(--accent); }
   thead th[aria-sort=ascending]::after { content: " \25B2"; font-size: 10px; }
@@ -50,9 +51,23 @@
   tbody tr:hover { background: var(--hover); }
   td.name { font-weight: 500; }
   td.name small { display: block; font-weight: 400; color: var(--muted); }
+  .device { display: flex; align-items: center; gap: 6px; }
+  button.read {
+    flex: none; display: grid; place-items: center; width: 28px; height: 28px; padding: 0;
+    border: 0; border-radius: 50%; background: transparent; color: var(--muted); cursor: pointer;
+  }
+  button.read:hover:not(:disabled) { color: var(--accent); background: var(--head); }
+  button.read:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button.read:disabled { cursor: default; opacity: 0.4; }
+  button.read.busy { color: var(--accent); }
+  button.read.busy svg { animation: spin 1s linear infinite; }
+  button.read.ok { color: var(--ok); }
+  button.read.fail { color: var(--bad); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { button.read.busy svg { animation: none; } }
   .none { color: var(--muted); }
   td.warn { color: var(--bad); background: var(--warn-bg); font-weight: 500; }
-  tfoot td { font-weight: 500; background: var(--head); position: sticky; bottom: 0; }
+  tfoot td { font-weight: 500; background: var(--head); position: sticky; bottom: 0; z-index: 2; }
   #error { color: var(--bad); }
 </style>
 </head>
@@ -84,13 +99,20 @@ const COLUMNS = [
   ["sent_scene", "Scene", "Scene (link) commands the bridge sent that it hears"],
   ["queries", "Queries", "State reads the bridge sent"],
   ["observed", "Observed", "Traffic from anyone else: keypad and local presses, other controllers"],
-  ["timeouts", "Timeouts", "Queries it didn't answer"],
+  ["timeouts", "Timeouts", "Queries it never answered, retry included"],
   ["latency_ms", "Latency", "Reply time of the last state query (ms), from the PIM accepting it"],
   ["tx_count", "TX", "Transmit count in use"],
   ["last_heard", "Last heard", "When it last sent anything"],
 ];
 const SUMMED = ["state_changes", "sent", "sent_scene", "queries", "observed", "timeouts"];
 const REFRESH_MS = 5000;
+const FAST_REFRESH_MS = 1000;  // while a device read is outstanding
+// A query that misses is retried after 5 s; allow for that and a queue wait
+const READ_WAIT_MS = 20000;
+const OUTCOME_MS = 4000;
+const ICON = "M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 " +
+  "19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 " +
+  "16.22,7.78L13,11H20V4L17.65,6.35Z";  // mdi:refresh
 
 const store = {
   get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
@@ -98,6 +120,9 @@ const store = {
 };
 let sort = store.get("upb-sort") || { key: "name", dir: 1 };
 let data = null;
+let timer = null;
+const reading = new Map();  // unit -> {heard, timeouts, until}: read requested, no answer yet
+const outcomes = new Map();  // unit -> {cls, text, until}: how the last read went
 
 const el = (tag, text, cls) => {
   const node = document.createElement(tag);
@@ -117,6 +142,73 @@ function ago(iso) {
 function levelText(levels) {
   if (!levels.length || levels.every(l => l === null)) return null;
   return levels.map(l => l === null ? "?" : l === 0 ? "Off" : `${l}%`).join(" / ");
+}
+
+function readButton(row) {
+  const button = el("button", undefined, "read");
+  button.type = "button";
+  button.dataset.unit = row.unit;
+  const outcome = outcomes.get(row.unit);
+  if (reading.has(row.unit)) {
+    button.classList.add("busy");
+    button.title = "Reading…";
+  } else if (outcome) {
+    button.classList.add(outcome.cls);
+    button.title = outcome.text;
+  } else {
+    button.title = "Read its state now";
+  }
+  button.setAttribute("aria-label", `Read ${row.name} state now`);
+  button.disabled = !data.pim_connected || reading.has(row.unit);
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "18");
+  svg.setAttribute("height", "18");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICON);
+  path.setAttribute("fill", "currentColor");
+  svg.append(path);
+  button.append(svg);
+  button.addEventListener("click", () => readDevice(row));
+  return button;
+}
+
+async function readDevice(row) {
+  if (reading.has(row.unit)) return;
+  outcomes.delete(row.unit);
+  reading.set(row.unit, { heard: row.last_heard, timeouts: row.timeouts, until: Date.now() + READ_WAIT_MS });
+  renderRows();
+  try {
+    const response = await fetch(`refresh/${row.unit}`, { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (err) {
+    reading.delete(row.unit);
+    outcomes.set(row.unit, { cls: "fail", text: `Couldn't send the read (${err.message})`,
+                             until: Date.now() + OUTCOME_MS });
+    renderRows();
+    return;
+  }
+  schedule(FAST_REFRESH_MS);
+}
+
+// A read is done when the device is heard from, or its query times out
+function settleReads() {
+  const now = Date.now();
+  for (const [unit, read] of reading) {
+    const row = data.devices.find(r => r.unit === unit);
+    if (row && row.last_heard !== read.heard) {
+      outcomes.set(unit, { cls: "ok", text: "Answered", until: now + OUTCOME_MS });
+    } else if (!row || row.timeouts > read.timeouts || now > read.until) {
+      outcomes.set(unit, { cls: "fail", text: "No answer", until: now + OUTCOME_MS });
+    } else {
+      continue;
+    }
+    reading.delete(unit);
+  }
+  for (const [unit, outcome] of outcomes) {
+    if (now > outcome.until) outcomes.delete(unit);
+  }
 }
 
 // Value used for sorting; null always sorts last
@@ -158,13 +250,18 @@ function renderRows() {
     return (x < y ? -1 : 1) * sort.dir;
   });
 
+  const focused = document.activeElement?.dataset?.unit;
   document.getElementById("rows").replaceChildren(...rows.map(row => {
     const tr = el("tr");
     for (const [key] of COLUMNS) {
       let td;
       if (key === "name") {
-        td = el("td", row.name, "name");
-        if (row.product) td.append(el("small", row.product));
+        td = el("td", undefined, "name");
+        const label = el("div", row.name);
+        if (row.product) label.append(el("small", row.product));
+        const device = el("div", undefined, "device");
+        device.append(readButton(row), label);
+        td.append(device);
       } else if (key === "level") {
         const text = levelText(row.level);
         td = el("td", text ?? "—", text ? "" : "none");
@@ -180,6 +277,7 @@ function renderRows() {
     }
     return tr;
   }));
+  if (focused) document.querySelector(`button.read[data-unit="${focused}"]`)?.focus();
 
   const totals = document.getElementById("totals");
   totals.replaceChildren(...COLUMNS.map(([key], i) => {
@@ -196,23 +294,30 @@ function renderStatus() {
     `Counting since ${new Date(data.since).toLocaleString()} · tx_count ${data.tx_count}`;
 }
 
-async function refresh() {
+function schedule(ms) {
+  clearTimeout(timer);
+  timer = setTimeout(load, ms);
+}
+
+async function load() {
   try {
     const response = await fetch("stats.json", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     data = await response.json();
     document.getElementById("error").textContent = "";
+    settleReads();
     renderStatus();
     renderRows();
   } catch (err) {
     document.getElementById("error").textContent = `Can't reach the add-on (${err.message})`;
+  } finally {
+    schedule(reading.size ? FAST_REFRESH_MS : REFRESH_MS);
   }
 }
 
 document.getElementById("filter").addEventListener("input", renderRows);
 renderHead();
-refresh();
-setInterval(refresh, REFRESH_MS);
+load();
 </script>
 </body>
 </html>

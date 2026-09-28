@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1
+
+- Device table: a refresh icon beside each device's name reads its state
+  now (like its *Refresh state* button). It spins until the device answers,
+  then turns green, or red if it didn't answer.
+- Fix: `timeouts` counted a query twice when upb-lib's retry of it was
+  missed too, and counted a query answered on the retry. It now counts
+  queries never answered.
+- Fix (device table): rows showed through the Device heading and the
+  totals row's first cell when scrolled.
+
 ## 0.6.0
 
 - New diagnostic sensor *State changes* on each UPB device: how often its

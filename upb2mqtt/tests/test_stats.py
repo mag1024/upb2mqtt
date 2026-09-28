@@ -85,11 +85,13 @@ def main() -> int:
     check("still pending", stats.pending is not None, True)
 
     # Timeouts
-    stats.timed_out(15)
-    check("timeout counted", stats[15].timeouts, 1)
+    stats.timed_out(15, retrying=True)
+    check("missed attempt that's resent isn't a timeout", stats[15].timeouts, 0)
     check("timeout clears pending", stats.pending, None)
-    stats.timed_out(15, count=False)
-    check("probe timeout not counted", stats[15].timeouts, 1)
+    stats.timed_out(15, retrying=False)
+    check("retry missed too -> one timeout", stats[15].timeouts, 1)
+    stats.timed_out(15, retrying=False, probe=True)
+    check("probe miss not counted", stats[15].timeouts, 1)
     stats.accepted(15)
     stats.disconnected()
     check("disconnect clears pending", stats.pending, None)
