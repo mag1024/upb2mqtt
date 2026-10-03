@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.7.0
+
+- Optional second PIM (`pim_b_url`), for a PIM on each powerline leg. With
+  `tx_count: auto`, a device PIM A doesn't reach with a single transmission
+  is tried once from PIM B before falling back to two from PIM A, and each
+  message goes out on the PIM that needs the fewest transmissions. Only
+  one PIM transmits at a time. Either PIM keeps UPB working while the other
+  is down; when PIM B comes back only its devices are tried again. A
+  repeated message both PIMs hear is handled once. See *Two PIMs* in the
+  documentation.
+- PIM B has its own HA device (connected, signal strength, noise floor);
+  with two PIMs, lights stay available while either PIM is connected
+  (`<prefix>/powerline/status`). Light attributes, the stats sensor and the
+  device table show each device's PIM.
+- Each PIM has a *High noise* binary sensor (device class problem): on while
+  its noise floor is above 100.
+
+## 0.6.2
+
+- `tx_count: auto`: each device is probed with one single-transmission query
+  instead of two. Whether a device hears a single transmission follows the
+  powerline leg it's on, so one answer is enough; a device that later misses
+  a query still goes to 2. A full read of all devices is about 25 s shorter.
+
 ## 0.6.1
 
 - Device table: a refresh icon beside each device's name reads its state

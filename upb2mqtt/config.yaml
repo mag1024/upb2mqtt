@@ -1,5 +1,5 @@
 name: upb2mqtt
-version: "0.6.1"
+version: "0.7.0"
 slug: upb2mqtt
 description: Universal Powerline Bus (UPB) PIM to MQTT, with Home Assistant discovery
 url: https://gitea.ctl.luminal.org/mag/upb2mqtt
@@ -32,6 +32,7 @@ options:
   log_level: info
 schema:
   pim_url: str
+  pim_b_url: str?
   upe_file: str
   tx_count: list(1|2|auto)
   refresh_hours: int(0,168)

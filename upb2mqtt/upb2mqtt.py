@@ -2,13 +2,19 @@
 
 upb-lib owns the PIM (same library and state model as HA's UPB integration);
 this module maps its devices and links onto MQTT. Device state is published
-retained, so Home Assistant restarts cost no powerline traffic.
+retained, so Home Assistant restarts cost no powerline traffic. An optional
+second PIM, on the other phase, gets its own upb-lib connection (pims.py);
+each message goes out on whichever PIM reaches its destination with the
+fewest transmissions (txcount.py).
 
 Topics (prefix defaults to "upb"; <idx> is upb-lib's index, e.g. 1_14_0 / 1_17):
   <prefix>/status                      bridge online/offline (LWT, retained)
   <prefix>/pim/status                  PIM online/offline (retained)
   <prefix>/pim/signal                  {"signal_strength", "noise_floor", "noise_counts"}
                                        from the PIM's own registers (retained)
+  <prefix>/pim_b/status, pim_b/signal  the same for the second PIM (B), if any
+  <prefix>/powerline/status            online while either PIM is (retained; with
+                                       two PIMs, the lights' availability)
   <prefix>/cmd                         {"command": "sync"}
   <prefix>/light/<idx>/state           {"state": "ON", "brightness": 0-100} (retained)
   <prefix>/light/<idx>/attributes      static device info (retained)
@@ -34,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -53,12 +60,14 @@ from upb_lib.links import UPB_COMMAND_TO_ACTION_MAPPING, Link
 from upb_lib.message import PIM_ID, decode
 
 from keypads import INDICATE, LEVEL_ON, Keypad, Members, parse_keypads, scene_active
+from pims import Duplicates, Line, SecondPim
 from scenes import ACTIVATE, Scene, plan
 from stats import Stats
 from txcount import TxCounts, TxEncoder
 import web
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
+PIM_NAMES = "AB"  # the first PIM (pim_url) and the second (pim_b_url)
 LOG = logging.getLogger("upb2mqtt")
 
 OPTIONS_FILE = Path("/data/options.json")
@@ -77,14 +86,21 @@ FLASH_SECONDS = {FLASH_TIME_SHORT: 0.5, FLASH_TIME_LONG: 1.5, "short": 0.5, "lon
 # serial link; nothing is sent on the powerline.
 SIGNAL_REGISTER, SIGNAL_REGISTER_COUNT = 0xF9, 7
 SIGNAL_INTERVAL = 60  # seconds between reads (also read on every PIM connect)
+NOISE_PROBLEM = 100  # noise floor above which a PIM's "High noise" reports a problem
 
-# tx_count "auto": a device counts as answering a single transmission only if
-# it answers every one of these queries in a row; the rest get TX_AUTO_REPEAT.
+# tx_count "auto": a device counts as answering a single transmission if it
+# answers these queries (one is enough: whether it does follows the powerline
+# leg it's on); the rest get TX_AUTO_REPEAT. With a second PIM, a device the
+# first doesn't reach that way is probed from the second, and only one
+# neither reaches gets TX_AUTO_REPEAT. One that later misses a query goes to
+# TX_AUTO_REPEAT then (_tx_timeout).
 # Measured on a real PIM, replies to a single transmission arrive 0.74-0.99 s
 # after the query is sent (the query 0.35 s, the reply about as long).
-TX_PROBES = 2
+TX_PROBES = 1
 TX_PROBE_TIMEOUT = 1.5
 TX_AUTO_REPEAT = 2
+# How long the first full read waits for a PIM that hasn't connected yet
+PIM_CONNECT_WAIT = 10.0
 UPB_RESPONSE_TIME = upb_connection.MESSAGE_RESPONSE_TIME
 
 # Powerline messages counted as observed traffic (see stats.py)
@@ -129,6 +145,24 @@ class Bridge:
         self.prefix = opts.topic_prefix.rstrip("/")
         self.disc_prefix = opts.discovery_prefix.rstrip("/")
         self.pim = UpbPim({"url": opts.pim_url, "UPStartExportFile": opts.upe_file})
+        self.second: SecondPim | None = None
+        self.duplicates: Duplicates | None = None
+        if opts.pim_b_url:
+            if opts.pim_b_url == opts.pim_url:
+                raise SystemExit("pim_b_url must be a different PIM from pim_url")
+            self.duplicates = Duplicates()
+            self.second = SecondPim(opts.pim_b_url, functools.partial(self._heard, 1))
+        # pylint: disable=protected-access
+        self.conns = [self.pim._connection] + ([self.second.connection] if self.second else [])
+        # upb-lib's dispatch of everything the first PIM hears (and, through
+        # _heard, the second); with two PIMs, each message passes _heard first
+        self._notify = self.pim._notifier.notify
+        if self.second:
+            self.pim._notifier.notify = functools.partial(self._heard, 0)
+        # One PIM transmits at a time
+        self.line = Line(self.conns) if self.second else None
+        self.ever_connected: set[int] = set()
+        self.loaded_at = 0.0  # loop time
 
         self.retained: dict[str, str] = {}  # topic -> payload; replayed on reconnect
         self.outbox: asyncio.Queue[tuple[str, str, bool]] = asyncio.Queue()
@@ -156,8 +190,9 @@ class Bridge:
         self.tx_default = TX_AUTO_REPEAT if self.tx_auto else int(mode)
         self.tx: TxCounts | None = None
         self.tx_names: dict[int, str] = {}  # every UPB unit, keypads included
-        self.tx_probing: tuple[int, asyncio.Future[bool]] | None = None
+        self.tx_probing: tuple[int, int, asyncio.Future[bool]] | None = None  # upb id, PIM
         self.tx_task: asyncio.Task[None] | None = None
+        self.tx_full = False  # tx_task reads every device (else only PIM B's)
 
     # ---- topics ----------------------------------------------------------
 
@@ -165,9 +200,20 @@ class Bridge:
     def status_topic(self) -> str:
         return f"{self.prefix}/status"
 
+    def pim_topic(self, pim: int = 0) -> str:
+        return f"{self.prefix}/{self._pim_slug(pim)}/status"
+
     @property
-    def pim_topic(self) -> str:
-        return f"{self.prefix}/pim/status"
+    def available_topic(self) -> str:
+        """What lights need online to be available: a PIM, or either PIM."""
+        return f"{self.prefix}/powerline/status" if self.second else self.pim_topic()
+
+    @staticmethod
+    def _pim_slug(pim: int) -> str:
+        return "pim" if pim == 0 else f"pim_{PIM_NAMES[pim].lower()}"
+
+    def _pim_name(self, pim: int) -> str:
+        return f"PIM {PIM_NAMES[pim]}" if self.second else "PIM"
 
     def light_topic(self, device: UpbDevice, leaf: str) -> str:
         return f"{self.prefix}/light/{device.index}/{leaf}"
@@ -175,9 +221,8 @@ class Bridge:
     def link_topic(self, link: Link, leaf: str) -> str:
         return f"{self.prefix}/link/{link.index}/{leaf}"
 
-    @property
-    def signal_topic(self) -> str:
-        return f"{self.prefix}/pim/signal"
+    def signal_topic(self, pim: int = 0) -> str:
+        return f"{self.prefix}/{self._pim_slug(pim)}/signal"
 
     def keypad_topic(self, keypad: Keypad, leaf: str) -> str:
         return f"{self.prefix}/keypad/{self.pim.network_id}_{keypad.upb_id}/{leaf}"
@@ -188,6 +233,7 @@ class Bridge:
     # ---- setup -----------------------------------------------------------
 
     async def load(self) -> None:
+        self.loaded_at = asyncio.get_running_loop().time()
         await self.pim.load_upstart_file()
         if not self.pim.config_ok or self.pim.network_id is None:
             raise SystemExit(f"Cannot load UPStart export file {self.opts.upe_file}")
@@ -223,14 +269,18 @@ class Bridge:
             self.pim.flags,
         )
 
-        self.pim.add_handler("connected", lambda: self._set_pim_status(True))
-        self.pim.add_handler("disconnected", lambda: self._set_pim_status(False))
-        self._set_pim_status(False)
+        self.pim.add_handler("connected", lambda: self._set_pim_status(0, True))
+        self._on_each_pim("disconnected", lambda pim: self._set_pim_status(pim, False))
+        if self.second:
+            self.second.add_handler("connected", self._second_connected)
+            self.second.add_handler("timeout", self._second_timeout)
+        for pim in range(len(self.conns)):
+            self._set_pim_status(pim, False)
         if self.opts.keypad_sync and all_keypads:
             self._load_keypads(all_keypads)
         # Replaces upb-lib's device sync, which it runs on connect
         self.pim.devices.sync = self._read_all
-        self.signal_enabled = self._watch_pim_lines()
+        self.signal_enabled = all([self._watch_pim_lines(pim) for pim in range(len(self.conns))])
         if self.signal_enabled:
             self.pim.add_handler("connected", self._read_signal)
 
@@ -302,7 +352,7 @@ class Bridge:
                     "product": device.product,
                     "version": device.version,
                     "dimmable": device.dimmable,
-                    "tx_count": self.tx.device(device.addr.upb_id),
+                    **self._route_info(device.addr.upb_id),
                 },
             )
 
@@ -318,9 +368,58 @@ class Bridge:
         if self.connected_to_broker:
             self.outbox.put_nowait((topic, payload, retain))
 
-    def _set_pim_status(self, online: bool) -> None:
-        LOG.info("PIM %s", "connected" if online else "disconnected")
-        self._publish(self.pim_topic, "online" if online else "offline")
+    def _set_pim_status(self, pim: int, online: bool) -> None:
+        LOG.info("%s %s", self._pim_name(pim), "connected" if online else "disconnected")
+        self._publish(self.pim_topic(pim), "online" if online else "offline")
+        if online:
+            self.ever_connected.add(pim)
+        elif self.line:
+            self.line.disconnected(pim)
+            if pim == 1 and self.tx:
+                self.tx.single[1].clear()  # it may come back elsewhere
+        if self.second:
+            self._publish(self.available_topic, "online" if self._online() else "offline")
+            if self.tx:
+                self._publish_device_attributes()  # routes may have moved
+
+    def _online(self) -> bool:
+        """Whether any PIM is connected."""
+        return any(connection.is_connected() for connection in self.conns)
+
+    def _on_each_pim(self, event: str, handler) -> None:
+        """handler(pim, ...) on a connection event (connected, disconnected,
+        timeout) of every PIM."""
+        for pim, owner in enumerate([self.pim, self.second][: len(self.conns)]):
+            owner.add_handler(event, functools.partial(handler, pim))
+
+    def _second_connected(self) -> None:
+        self._set_pim_status(1, True)
+        # What upb-lib sends the first PIM on connect: a read that clears its
+        # receive buffer, and message (not pulse) mode
+        self._send("0001FF", command=PimCommand.READ_PIM_REGISTERS, pim=1)
+        self._send("70028E", command=PimCommand.WRITE_PIM_REGISTERS, pim=1)
+        if self.signal_enabled:
+            self._read_signal(1)
+        if not self.pim.is_connected():
+            if not (self.tx_task and self.tx_full):
+                self._read_all()  # all through PIM B for now
+        elif self.tx_auto and not (self.tx_task and self.tx_full):
+            # Learn which devices it reaches; a full read in progress does
+            # that itself. With a fixed tx_count PIM B is a standby.
+            self._start_probe(self._probe_second_pass(), full=False)
+
+    def _second_timeout(self, addr: bytearray | None) -> None:
+        # upb-lib logs the first PIM's
+        if addr and not self.tx_probing:
+            LOG.warning("Timeout communicating with UPB device %d via PIM B", addr[1])
+
+    def _heard(self, pim: int, notify_type: str, params: dict[str, Any]) -> None:
+        """A PIM's events and the messages it hears, on their way to upb-lib's
+        handlers and ours; a message the other PIM heard or sent is dropped."""
+        if "msg" in params and not self.duplicates.heard(pim, params["msg"]):
+            LOG.debug("%s also heard %s", self._pim_name(pim), params["msg"])
+            return
+        self._notify(notify_type, params)
 
     def _device_changed(self, device: UpbDevice, changeset: dict[str, Any]) -> None:
         status = device.status
@@ -357,15 +456,16 @@ class Bridge:
 
     # ---- PIM signal / noise ----------------------------------------------
 
-    def _watch_pim_lines(self) -> bool:
+    def _watch_pim_lines(self, pim: int) -> bool:
         """See PIM lines upb-lib reads but doesn't pass on: register reports,
-        and the PIM accepting a query (where its latency is timed from).
+        and the PIM accepting a message (where a query's latency is timed
+        from, and where the other PIM may start hearing it).
 
         Wraps upb-lib's private line handler (upb-lib 0.7.2); every line still
         goes on to upb-lib unchanged.
         """
         # pylint: disable=protected-access
-        connection = getattr(self.pim, "_connection", None)
+        connection = self.conns[pim]
         original = getattr(connection, "_handle_pim_command", None)
         if original is None:
             LOG.warning("This upb-lib hides PIM register reports; "
@@ -375,33 +475,40 @@ class Bridge:
         async def handle(command: str, data: str) -> None:
             try:
                 if command == "PR":
-                    self._register_report(data)
-                elif command == "PA" and (awaiting := connection._awaiting_response_command):
-                    self.stats.accepted(awaiting[1])
+                    self._register_report(pim, data)
+                elif command == "PA" and connection._write_queue:
+                    head = connection._write_queue[0]
+                    if self.duplicates and head.pim_command == PimCommand.TX_UPB_MSG:
+                        self.duplicates.sent(pim, decode(head.msg)[1])
+                    if awaiting := connection._awaiting_response_command:
+                        self.stats.accepted(awaiting[1])
             except Exception:  # pylint: disable=broad-except
                 LOG.exception("Error handling PIM line %s%r", command, data)
             await original(command, data)
+            if self.line:
+                self.line.pim_line(pim, command, data)
 
         connection._handle_pim_command = handle
         return True
 
-    def _read_signal(self) -> None:
-        self.pim.send(
+    def _read_signal(self, pim: int = 0) -> None:
+        self._send(
             register_read(SIGNAL_REGISTER, SIGNAL_REGISTER_COUNT),
             command=PimCommand.READ_PIM_REGISTERS,
+            pim=pim,
         )
 
-    def _register_report(self, data: str) -> None:
+    def _register_report(self, pim: int, data: str) -> None:
         try:
             start, values = int(data[:2], 16), bytes.fromhex(data[2:])
         except ValueError:
             return
         if start != SIGNAL_REGISTER or len(values) < SIGNAL_REGISTER_COUNT:
             return  # e.g. upb-lib's own heartbeat read
-        LOG.debug("PIM signal %d, noise floor %d, noise counts %s",
+        LOG.debug("%s signal %d, noise floor %d, noise counts %s", self._pim_name(pim),
                   values[0], values[1], values[2:SIGNAL_REGISTER_COUNT].hex())
         self._publish(
-            self.signal_topic,
+            self.signal_topic(pim),
             {
                 "signal_strength": values[0],
                 "noise_floor": values[1],
@@ -415,38 +522,30 @@ class Bridge:
             return
         while True:
             await asyncio.sleep(SIGNAL_INTERVAL)
-            if self.pim.is_connected():
-                self._read_signal()
+            for pim, connection in enumerate(self.conns):
+                if connection.is_connected():
+                    self._read_signal(pim)
 
     # ---- device statistics -----------------------------------------------
 
     def _watch_traffic(self) -> None:
         """Count what the bridge sends and what it hears, per device."""
-        self.stats.link_members = self.tx.link_listeners
-        send = self.pim.send  # upb-lib's elements send through this too
-
-        def counted_send(msg, rsp=None, command=PimCommand.TX_UPB_MSG):
-            if command == PimCommand.TX_UPB_MSG:
-                self.stats.sent(decode(msg)[1])
-            send(msg, rsp, command)
-
-        self.pim.send = counted_send
+        self.stats.link_members = self.tx.link_listeners  # _send counts what's sent
         for command in HEARD_COMMANDS:
             self.pim.add_handler(command.value, self.stats.heard)
-        self.pim.add_handler("timeout", self._stats_timeout)
-        self.pim.add_handler("disconnected", self.stats.disconnected)
+        self._on_each_pim("timeout", self._stats_timeout)
+        self._on_each_pim("disconnected", lambda pim: self.stats.disconnected())
 
-    def _stats_timeout(self, addr: bytearray | None) -> None:
+    def _stats_timeout(self, pim: int, addr: bytearray | None) -> None:
         if not addr:
             return
         # upb-lib notifies before using up the query's retry: one left means
         # it goes out again
         # pylint: disable=protected-access
-        queue = self.pim._connection._write_queue
+        queue = self.conns[pim]._write_queue
         retrying = bool(queue) and queue[0].retry_count > 0
         # A device missing a single-transmission probe isn't a fault
-        probe = bool(self.tx_probing and self.tx_probing[0] == addr[1])
-        self.stats.timed_out(addr[1], retrying, probe)
+        self.stats.timed_out(addr[1], retrying, self._probing(addr[1], pim))
 
     def _units(self) -> dict[int, list[UpbDevice]]:
         """Each UPB device's lights (one per channel), by unit id."""
@@ -466,7 +565,8 @@ class Bridge:
     def status(self) -> dict[str, Any]:
         """Everything the device table shows (web.py)."""
         return {
-            "pim_connected": self.pim.is_connected(),
+            "pim_connected": self._online(),
+            "pims": [connection.is_connected() for connection in self.conns],
             "since": datetime.fromtimestamp(self.stats.started, timezone.utc).isoformat(),
             "tx_count": str(self.opts.tx_count),
             "devices": [
@@ -476,8 +576,10 @@ class Bridge:
                     "product": channels[0].product,
                     "level": [d.status if isinstance(d.status, int) and d.status >= 0 else None
                               for d in sorted(channels, key=lambda d: d.addr.channel)],
+                    "dimmable": [bool(d.dimmable)
+                                 for d in sorted(channels, key=lambda d: d.addr.channel)],
                     **self.stats[upb_id].as_dict(),
-                    "tx_count": self.tx.device(upb_id),
+                    **self._route_info(upb_id),
                 }
                 for upb_id, channels in self._units().items()
             ],
@@ -487,13 +589,13 @@ class Bridge:
         for upb_id in self._units():
             self._publish(
                 self.stats_topic(upb_id),
-                {**self.stats[upb_id].as_dict(), "tx_count": self.tx.device(upb_id)},
+                {**self.stats[upb_id].as_dict(), **self._route_info(upb_id)},
             )
 
     def refresh_unit(self, upb_id: int) -> bool:
         """Read a device's state now (the table's refresh icon)."""
         channels = self._units().get(upb_id)
-        if not channels or not self.pim.is_connected():
+        if not channels or not self._online():
             return False
         channels[0].update_status()  # one query answers for every channel
         return True
@@ -509,8 +611,35 @@ class Bridge:
 
     # ---- transmit counts -------------------------------------------------
 
+    def _route_info(self, upb_id: int) -> dict[str, int]:
+        """How messages to a device go out: tx_count, and with two PIMs, which (A or B)."""
+        pim, count = self.tx.route(False, upb_id)
+        return {"tx_count": count, **({"pim": PIM_NAMES[pim]} if self.second else {})}
+
+    def _send(self, msg: str, rsp: bytearray | None = None,
+              command: PimCommand = PimCommand.TX_UPB_MSG, pim: int | None = None,
+              retries: int | None = None) -> None:
+        """upb-lib's UpbPim.send (its elements send through this): a UPB
+        message goes out on the PIM its route picks, unless pim is given.
+        With two PIMs it waits its turn on the line."""
+        if command == PimCommand.TX_UPB_MSG:
+            message = decode(msg)[1]
+            self.stats.sent(message)
+            if pim is None:
+                # The encoder picked the transmit count from the same route
+                pim = self.tx.route(message.link, message.dest_id)[0]
+        pim = pim or 0
+        if self.line:
+            self.line.send(pim, command, msg, rsp, retries)
+            return
+        self.conns[pim].send(command, msg, rsp)
+        if retries is not None:
+            # pylint: disable=protected-access
+            self.conns[pim]._write_queue[-1].retry_count = retries
+
     def _load_tx_counts(self, keypads: dict[int, Keypad]) -> None:
-        self.tx = TxCounts(self.tx_default)
+        self.tx = TxCounts(self.tx_default, len(self.conns))
+        self.tx.online = lambda pim: self.conns[pim].is_connected()
         # A link is heard by the devices in it and by keypads showing it on an LED
         for link in self.pim.links.elements.values():
             self.tx.add_listeners(
@@ -520,11 +649,13 @@ class Bridge:
             for link_id in keypad.links():
                 self.tx.add_listeners(link_id, [upb_id])
         self.pim.encoder = TxEncoder(self.tx.for_addr)
+        self.pim.send = self._send
         if not self.tx_auto:
-            LOG.info("Transmit count %d for every device (tx_count option)", self.tx_default)
+            LOG.info("Transmit count %d for every device (tx_count option)%s", self.tx_default,
+                     "; PIM B is used only while PIM A is disconnected" if self.second else "")
             return
         self.pim.add_handler("disconnected", self._stop_tx_probe)
-        self.pim.add_handler("timeout", self._tx_timeout)
+        self._on_each_pim("timeout", self._tx_timeout)
         self.pim.add_handler(UpbCommand.DEVICE_STATE_REPORT.value, self._tx_report)
         # A device missing a single transmission is expected, not worth a warning
         logging.getLogger("upb_lib.upb").addFilter(
@@ -538,66 +669,130 @@ class Bridge:
         first (see _probe_tx).
         """
         if self.tx_auto:
-            self._stop_tx_probe()
-            self.tx_task = asyncio.get_running_loop().create_task(self._probe_tx())
+            self._start_probe(self._probe_tx(), full=True)
             return
         UpbDevices.sync(self.pim.devices)  # upb-lib's own
         for upb_id in self.keypads:
             self._query(upb_id)
 
-    def _query(self, upb_id: int, ctl: int = -1) -> None:
+    def _query(self, upb_id: int, ctl: int = -1, pim: int | None = None,
+               retries: int | None = None) -> None:
         """Report State: the reply is the device's state (a keypad's: its LEDs)."""
         addr = UpbAddr(self.pim.network_id, upb_id, 0)
-        self.pim.send(
+        self._send(
             self.pim.encoder.report_state(addr, ctl),
             bytearray([self.pim.network_id, upb_id]),
+            pim=pim,
+            retries=retries,
         )
+
+    def _start_probe(self, probe, full: bool) -> None:
+        self._stop_tx_probe()
+        self.tx_task = asyncio.get_running_loop().create_task(probe)
+        self.tx_full = full
 
     def _stop_tx_probe(self) -> None:
         if self.tx_task:
             self.tx_task.cancel()
             self.tx_task = None
 
-    async def _probe_tx(self) -> None:
-        """Read every device, learning which answer a message sent only once."""
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        LOG.info("Reading %d devices, single transmission first", len(self.tx_names))
-        lights = {d.addr.upb_id for d in self.pim.devices.elements.values()}
+    def _probe_order(self) -> list[int]:
         # Lights first: keypad LEDs are compared with the lights' states once
         # everything has been read (see _reconcile_keypad)
-        for upb_id in sorted(self.tx_names, key=lambda i: i in self.keypads):
-            single = True
-            for _ in range(TX_PROBES):
-                if not await self._probe_once(upb_id):
-                    single = False
-                    break
-            self.tx.single[upb_id] = single
-            if not single and (upb_id in lights or upb_id in self.keypads):
+        return sorted(self.tx_names, key=lambda i: i in self.keypads)
+
+    async def _probe_tx(self) -> None:
+        """Read every device, learning which answer a message sent only once,
+        and from which PIM: the first, else the second; else the first sends
+        it repeated."""
+        started = asyncio.get_running_loop().time()
+        await self._await_pims()
+        LOG.info("Reading %d devices, single transmission first", len(self.tx_names))
+        lights = {d.addr.upb_id for d in self.pim.devices.elements.values()}
+        for upb_id in self._probe_order():
+            if await self._learn(upb_id, range(len(self.conns))) is None \
+                    and (upb_id in lights or upb_id in self.keypads):
                 self._query(upb_id)  # read again, at the repeat count
-        await self._pim_idle()  # the last of those reads answered
+        # PIM B if it connected since this started, for the devices it missed
+        await self._probe_second()
+        await self._learned(started)
+
+    async def _await_pims(self) -> None:
+        """Just after the bridge starts, give a PIM that hasn't connected yet
+        a moment to, so that the first read doesn't send repeats to devices
+        it would reach with one."""
+        loop = asyncio.get_running_loop()
+        deadline = self.loaded_at + PIM_CONNECT_WAIT
+        while len(self.ever_connected) < len(self.conns) and loop.time() < deadline:
+            await asyncio.sleep(0.1)
+
+    async def _probe_second(self) -> None:
+        """Probe from PIM B the devices PIM A doesn't reach with one
+        transmission and PIM B hasn't been tried for. Their state is known
+        already, so one that doesn't answer isn't read again."""
+        if not self.second:
+            return
+        for upb_id in self._probe_order():
+            if not self.tx.single[0].get(upb_id) and upb_id not in self.tx.single[1]:
+                await self._learn(upb_id, [1])
+
+    async def _probe_second_pass(self) -> None:
+        """PIM B connected after the last full read: learn just its devices."""
+        started = asyncio.get_running_loop().time()
+        LOG.info("PIM B connected; trying it for devices PIM A doesn't reach once")
+        await self._probe_second()
+        await self._learned(started)
+
+    async def _learn(self, upb_id: int, pims) -> int | None:
+        """Probe a device from each PIM in turn until one is answered; that PIM."""
+        pims = list(pims)
+        for pim in pims:
+            self.tx.single[pim].pop(upb_id, None)  # not tried
+        for pim in pims:
+            if self.conns[pim].is_connected():
+                self.tx.single[pim][upb_id] = await self._probe_answered(upb_id, pim)
+                if self.tx.single[pim][upb_id]:
+                    return pim
+        return None
+
+    async def _learned(self, started: float) -> None:
+        await self._pim_idle()  # the last reads answered
         self.tx_task = None
         for upb_id in self.keypads:
             self._schedule_keypad(upb_id)
         self._publish_device_attributes()
-        LOG.info("Transmit counts learned in %.0f s", loop.time() - started)
-        for count, single in ((1, True), (self.tx_default, False)):
-            ids = [i for i in self.tx_names if self.tx.single.get(i) is single]
-            LOG.info("Transmit count %d, %d devices:%s", count, len(ids),
+        LOG.info("Transmit counts learned in %.0f s",
+                 asyncio.get_running_loop().time() - started)
+        routes: dict[tuple[int, int], list[int]] = {}
+        for upb_id in self.tx_names:
+            routes.setdefault(self.tx.route(False, upb_id), []).append(upb_id)
+        for (pim, count), ids in sorted(routes.items(), key=lambda r: (r[0][1], r[0][0])):
+            LOG.info("Transmit count %d%s, %d devices:%s", count,
+                     f" from {self._pim_name(pim)}" if self.second else "", len(ids),
                      "".join(f"\n  {i:3} {self.tx_names[i]}" for i in ids))
 
-    async def _probe_once(self, upb_id: int) -> bool:
+    async def _probe_answered(self, upb_id: int, pim: int) -> bool:
+        """Whether a device answers TX_PROBES single transmissions from a PIM."""
+        for _ in range(TX_PROBES):
+            if not await self._probe_once(upb_id, pim):
+                return False
+        return True
+
+    def _probing(self, upb_id: int, pim: int) -> bool:
+        return bool(self.tx_probing and self.tx_probing[:2] == (upb_id, pim))
+
+    async def _probe_once(self, upb_id: int, pim: int) -> bool:
         """Whether a device answers a single transmission (its reply is its state)."""
         # Probes go after other traffic, and a command waits for at most one
         await self._pim_idle()
         future = asyncio.get_running_loop().create_future()
-        self.tx_probing = (upb_id, future)
+        self.tx_probing = (upb_id, pim, future)
         try:
-            self._query(upb_id, ctl=0)  # control word 0: one transmission, no ack
-            # pylint: disable=protected-access
-            self.pim._connection._write_queue[-1].retry_count = 0  # no second try
+            # Control word 0: one transmission, no ack; no second try
+            self._query(upb_id, ctl=0, pim=pim, retries=0)
             # upb-lib reads its response timeout when it sends; the next
-            # message must get the normal one again (see _end_probe)
+            # message must get the normal one again (see _end_probe). Nothing
+            # else is sent meanwhile: the probe holds the line.
             upb_connection.MESSAGE_RESPONSE_TIME = TX_PROBE_TIMEOUT
             # _tx_report or _tx_timeout settle it, unless upb-lib is done with
             # the probe without either: after a PIM error (PE), or another
@@ -610,39 +805,43 @@ class Bridge:
             self.tx_probing = None
 
     async def _pim_idle(self) -> None:
-        """Wait until upb-lib has nothing queued or awaiting a reply."""
+        """Wait until nothing is waiting to be sent, in flight, or awaiting a reply."""
         # pylint: disable=protected-access
-        while self.pim._connection._write_queue:
+        while (not self.line.idle() if self.line
+               else any(c._write_queue for c in self.conns if c.is_connected())):
             await asyncio.sleep(0.1)
 
     def _end_probe(self, answered: bool) -> None:
         upb_connection.MESSAGE_RESPONSE_TIME = UPB_RESPONSE_TIME
-        if self.tx_probing and not self.tx_probing[1].done():
-            self.tx_probing[1].set_result(answered)
+        if self.tx_probing and not self.tx_probing[2].done():
+            self.tx_probing[2].set_result(answered)
 
     def _tx_report(self, msg) -> None:
         # A device answers with as many copies as it was sent, so a reply sent
-        # once is the answer to the probe, not to an earlier query
+        # once is the answer to the probe, not to an earlier query. Either
+        # PIM hearing it will do.
         if self.tx_probing and self.tx_probing[0] == msg.src_id and not msg.link \
                 and msg.tx_count == 0:
             self._end_probe(True)
 
-    def _tx_timeout(self, addr: bytearray | None) -> None:
+    def _tx_timeout(self, pim: int, addr: bytearray | None) -> None:
         if not addr:
             return
         upb_id = addr[1]
-        if self.tx_probing and self.tx_probing[0] == upb_id:
+        if self._probing(upb_id, pim):
             self._end_probe(False)
-        elif self.tx.single.get(upb_id):
-            LOG.warning("Device %d stopped answering single transmissions; now sending %d",
-                        upb_id, self.tx_default)
-            self.tx.single[upb_id] = False
+        elif self.tx.single[pim].get(upb_id):
+            LOG.warning("Device %d stopped answering single transmissions%s; now sending %d",
+                        upb_id, f" from {self._pim_name(pim)}" if self.second else "",
+                        self.tx_default)
+            self.tx.single[pim][upb_id] = False
             self._publish_device_attributes()
             # upb-lib retries the query that timed out (queued first) as it
-            # was encoded; send that retry repeated too
+            # was encoded; send that retry repeated too (from the same PIM:
+            # every device hears a repeated message)
             # pylint: disable=protected-access
-            self.pim._connection._write_queue[0].msg = self.pim.encoder.report_state(
-                UpbAddr(self.pim.network_id, upb_id, 0)
+            self.conns[pim]._write_queue[0].msg = self.pim.encoder.report_state(
+                UpbAddr(self.pim.network_id, upb_id, 0), ctl=(self.tx_default - 1) << 2
             )
 
     # ---- keypad LEDs -----------------------------------------------------
@@ -690,7 +889,7 @@ class Bridge:
     def _reconcile_keypad(self, upb_id: int) -> None:
         self.keypad_timers.pop(upb_id, None)
         keypad = self.keypads[upb_id]
-        if self.tx_task or not keypad.initialized or not self.pim.is_connected():
+        if self.tx_task or not keypad.initialized or not self._online():
             return  # every keypad is checked once all devices are read
         addr = UpbAddr(self.pim.network_id, upb_id, 0)
         for bit in self.managed_leds[upb_id]:
@@ -700,7 +899,7 @@ class Bridge:
             LOG.debug("Keypad %s: %s LED %s", keypad.name, keypad.label(bit), "on" if desired else "off")
             level = LEVEL_ON if desired else 0
             # pylint: disable=protected-access
-            self.pim.send(
+            self._send(
                 self.pim.encoder._encode_message(
                     -1, addr, PIM_ID, INDICATE, bytearray([level, 0, bit + 1])
                 )
@@ -722,9 +921,10 @@ class Bridge:
 
     # ---- discovery -------------------------------------------------------
 
-    def _availability(self) -> dict[str, Any]:
+    def _availability(self, pim_topic: str | None = None) -> dict[str, Any]:
         return {
-            "availability": [{"topic": self.status_topic}, {"topic": self.pim_topic}],
+            "availability": [{"topic": self.status_topic},
+                             {"topic": pim_topic or self.available_topic}],
             "availability_mode": "all",
         }
 
@@ -747,7 +947,7 @@ class Bridge:
         configs[f"{self.disc_prefix}/device/{bridge_id}/config"] = {
             "device": {
                 "identifiers": [bridge_id],
-                "name": "UPB PIM",
+                "name": "UPB PIM A" if self.second else "UPB PIM",
                 "manufacturer": "Powerline Control Systems",
                 "model": "PIM",
                 "sw_version": VERSION,
@@ -761,12 +961,12 @@ class Bridge:
                     "name": "Connected",
                     "device_class": "connectivity",
                     "entity_category": "diagnostic",
-                    "state_topic": self.pim_topic,
+                    "state_topic": self.pim_topic(),
                     "payload_on": "online",
                     "payload_off": "offline",
                     "availability_topic": self.status_topic,
                 },
-                **(self._signal_components(bridge_id) if self.signal_enabled else {}),
+                **(self._signal_components(bridge_id, 0) if self.signal_enabled else {}),
                 "sync": {
                     "platform": "button",
                     "unique_id": f"{bridge_id}_sync",
@@ -778,6 +978,34 @@ class Bridge:
                 },
             },
         }
+
+        if self.second:
+            pim_b_id = f"{bridge_id}_b"
+            configs[f"{self.disc_prefix}/device/{pim_b_id}/config"] = {
+                "device": {
+                    "identifiers": [pim_b_id],
+                    "name": "UPB PIM B",
+                    "manufacturer": "Powerline Control Systems",
+                    "model": "PIM",
+                    "sw_version": VERSION,
+                    **self._panel_link(),
+                },
+                "origin": self._origin(),
+                "components": {
+                    "pim": {
+                        "platform": "binary_sensor",
+                        "unique_id": f"{pim_b_id}_connected",
+                        "name": "Connected",
+                        "device_class": "connectivity",
+                        "entity_category": "diagnostic",
+                        "state_topic": self.pim_topic(1),
+                        "payload_on": "online",
+                        "payload_off": "offline",
+                        "availability_topic": self.status_topic,
+                    },
+                    **(self._signal_components(pim_b_id, 1) if self.signal_enabled else {}),
+                },
+            }
 
         # One HA device per UPB device; one light per channel
         for upb_id, channels in self._units().items():
@@ -882,14 +1110,14 @@ class Bridge:
 
         return {topic: json.dumps(cfg) for topic, cfg in configs.items()}
 
-    def _signal_components(self, bridge_id: str) -> dict[str, dict[str, Any]]:
+    def _signal_components(self, bridge_id: str, pim: int) -> dict[str, dict[str, Any]]:
         # Raw PIM units (0-255); no HA device_class fits, which would demand dB
         common = {
             "platform": "sensor",
             "entity_category": "diagnostic",
             "state_class": "measurement",
-            "state_topic": self.signal_topic,
-            **self._availability(),
+            "state_topic": self.signal_topic(pim),
+            **self._availability(self.pim_topic(pim)),
         }
         return {
             "signal_strength": {
@@ -905,9 +1133,20 @@ class Bridge:
                 "name": "Noise floor",
                 "icon": "mdi:waveform",
                 "value_template": "{{ value_json.noise_floor }}",
-                "json_attributes_topic": self.signal_topic,
+                "json_attributes_topic": self.signal_topic(pim),
                 "json_attributes_template":
                     "{{ {'noise_counts': value_json.noise_counts} | tojson }}",
+            },
+            "noise_problem": {
+                "platform": "binary_sensor",
+                "entity_category": "diagnostic",
+                "state_topic": self.signal_topic(pim),
+                **self._availability(self.pim_topic(pim)),
+                "unique_id": f"{bridge_id}_noise_problem",
+                "name": "High noise",
+                "device_class": "problem",
+                "value_template":
+                    f"{{{{ 'ON' if value_json.noise_floor > {NOISE_PROBLEM} else 'OFF' }}}}",
             },
         }
 
@@ -938,7 +1177,7 @@ class Bridge:
             LOG.warning("Ignoring non-JSON payload on %s: %r", topic, text)
             return
 
-        if not self.pim.is_connected():
+        if not self._online():
             LOG.warning("PIM not connected; dropping %s %s", topic, text)
             return
 
@@ -1000,7 +1239,7 @@ class Bridge:
         batch, self.batch = self.batch, {}
         if not batch:
             return
-        if not self.pim.is_connected():
+        if not self._online():
             LOG.warning("PIM not connected; dropping commands for %s", ", ".join(batch))
             return
         levels = {
@@ -1139,7 +1378,7 @@ class Bridge:
             return
         while True:
             await asyncio.sleep(self.opts.refresh_hours * 3600)
-            if self.pim.is_connected():
+            if self._online():
                 LOG.info("Periodic device state refresh")
                 self._read_all()
 
@@ -1183,6 +1422,7 @@ def supervisor_mqtt() -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     options: dict[str, Any] = {
         "pim_url": "",
+        "pim_b_url": "",
         "upe_file": "/homeassistant/network.upe",
         "topic_prefix": "upb",
         "discovery_prefix": "homeassistant",
@@ -1243,13 +1483,17 @@ async def main() -> None:
         async with asyncio.TaskGroup() as group:
             group.create_task(bridge.run_mqtt(broker))
             group.create_task(bridge.pim.async_connect())
+            if bridge.second:
+                group.create_task(bridge.second.connection.connect())
+                group.create_task(bridge.line.run())
             group.create_task(bridge.run_refresh())
             group.create_task(bridge.run_signal())
             group.create_task(bridge.run_stats())
             group.create_task(bridge.run_web())
     except asyncio.CancelledError:
         LOG.info("Shutting down")
-        bridge.pim.disconnect()
+        for connection in bridge.conns:
+            connection.disconnect()
 
 
 if __name__ == "__main__":

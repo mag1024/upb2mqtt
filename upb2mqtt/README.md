@@ -9,6 +9,7 @@ don't trigger a powerline re-read of every device. See [DOCS.md](DOCS.md).
 ```sh
 pip install -r requirements.txt amqtt
 python tests/test_bridge.py          # fake PIM + in-process broker
+python tests/test_dual_pim.py        # two fake PIMs on opposite phases
 python upb2mqtt.py --pim-url socket://10.0.5.3:2101 \
     --upe-file tests/test_network.upe --mqtt-host 127.0.0.1 --log-level debug
 ```

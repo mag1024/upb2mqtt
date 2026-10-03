@@ -10,12 +10,16 @@
     --bg: #fafafa; --card: #ffffff; --text: #212121; --muted: #727272;
     --line: #e0e0e0; --head: #f3f3f3; --accent: #03a9f4; --hover: #f5f9fc;
     --ok: #2e7d32; --bad: #c62828; --warn-bg: #fdecea;
+    --pim-a: #3f51b5; --pim-b: #00897b;  /* which PIM sends to a device */
+    --lit: #9a6700;  /* a light that's on: Home Assistant's amber, darkened to read on white */
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #111111; --card: #1c1c1c; --text: #e1e1e1; --muted: #9b9b9b;
       --line: #2f2f2f; --head: #232323; --accent: #4fc3f7; --hover: #242a2e;
       --ok: #81c784; --bad: #ef9a9a; --warn-bg: #3b2020;
+      --pim-a: #9fa8da; --pim-b: #4db6ac;
+      --lit: #ffca28;
     }
   }
   * { box-sizing: border-box; }
@@ -27,7 +31,22 @@
   h1 { font-size: 20px; font-weight: 500; margin: 0; }
   .pill { font-size: 12px; padding: 2px 10px; border-radius: 12px; border: 1px solid currentColor; }
   .pill.on { color: var(--ok); } .pill.off { color: var(--bad); }
+  .pims { display: flex; flex-wrap: wrap; gap: 6px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .meta { color: var(--muted); font-size: 13px; }
+  /* A device's PIM: a stripe on its name, and a chip ("PIM A", or "PIM A ×2"
+     when it's sent twice, outlined) */
+  .pim-A { --pim: var(--pim-a); } .pim-B { --pim: var(--pim-b); }
+  .dot { background: var(--pim); vertical-align: 1px; }
+  tbody td.name[class*=pim-] { box-shadow: inset 4px 0 0 var(--pim); }
+  .chip {
+    display: inline-block; min-width: 52px; padding: 1px 8px; border-radius: 10px; text-align: center;
+    font-size: 12px; font-weight: 500; color: var(--pim); border: 1px solid var(--pim);
+    background: color-mix(in srgb, var(--pim) 16%, transparent);
+  }
+  .chip.repeat { background: transparent; }
+  .counts span + span { margin-left: 8px; }
+  .counts .dot { margin-right: 4px; }
   .spacer { flex: 1; }
   input[type=search] {
     font: inherit; padding: 6px 10px; min-width: 200px; max-width: 100%;
@@ -66,6 +85,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { button.read.busy svg { animation: none; } }
   .none { color: var(--muted); }
+  .lit { color: var(--lit); font-weight: 500; }
   td.warn { color: var(--bad); background: var(--warn-bg); font-weight: 500; }
   tfoot td { font-weight: 500; background: var(--head); position: sticky; bottom: 0; z-index: 2; }
   #error { color: var(--bad); }
@@ -74,7 +94,7 @@
 <body>
 <header>
   <h1>UPB devices</h1>
-  <span id="pim" class="pill">…</span>
+  <span id="pims" class="pims"><span class="pill">…</span></span>
   <span id="since" class="meta"></span>
   <span id="error" class="meta"></span>
   <span class="spacer"></span>
@@ -102,8 +122,15 @@ const COLUMNS = [
   ["timeouts", "Timeouts", "Queries it never answered, retry included"],
   ["latency_ms", "Latency", "Reply time of the last state query (ms), from the PIM accepting it"],
   ["tx_count", "TX", "Transmit count in use"],
+  ["pim", "Sent via", "PIM that sends to it: the one needing the fewest transmissions. " +
+          "×2: no PIM reaches it with one, so it's sent twice"],
   ["last_heard", "Last heard", "When it last sent anything"],
 ];
+// With two PIMs, "Sent via" (PIM and transmit count) replaces TX
+const dual = () => (data?.pims?.length ?? 1) > 1;
+const columns = () => COLUMNS.filter(([key]) => key !== (dual() ? "tx_count" : "pim"));
+let headKeys = "";
+const PIM_NAMES = "AB";
 const SUMMED = ["state_changes", "sent", "sent_scene", "queries", "observed", "timeouts"];
 const REFRESH_MS = 5000;
 const FAST_REFRESH_MS = 1000;  // while a device read is outstanding
@@ -139,9 +166,15 @@ function ago(iso) {
   return `${(s / 86400).toFixed(1)} d ago`;
 }
 
-function levelText(levels) {
-  if (!levels.length || levels.every(l => l === null)) return null;
-  return levels.map(l => l === null ? "?" : l === 0 ? "Off" : `${l}%`).join(" / ");
+// Each channel's level ("On" for a relay); lit ones in the "on" colour
+function levelCell(levels, dimmable = []) {
+  if (!levels.length || levels.every(l => l === null)) return el("td", "—", "none");
+  const td = el("td");
+  levels.forEach((l, i) => {
+    if (i) td.append(" / ");
+    td.append(l > 0 ? el("span", dimmable[i] === false ? "On" : `${l}%`, "lit") : l === 0 ? "Off" : "?");
+  });
+  return td;
 }
 
 function readButton(row) {
@@ -216,12 +249,14 @@ function sortValue(row, key) {
   if (key === "name") return row.name.toLowerCase();
   if (key === "level") return row.level.some(l => l !== null) ? Math.max(...row.level.map(l => l ?? 0)) : null;
   if (key === "last_heard") return row.last_heard ? Date.parse(row.last_heard) : null;
+  if (key === "pim") return row.pim ? `${row.pim}${row.tx_count}` : null;  // then single before repeated
   return row[key];
 }
 
 function renderHead() {
   const tr = document.getElementById("columns");
-  tr.replaceChildren(...COLUMNS.map(([key, label, tip]) => {
+  headKeys = columns().map(([key]) => key).join();
+  tr.replaceChildren(...columns().map(([key, label, tip]) => {
     const th = el("th", label);
     th.title = tip;
     th.scope = "col";
@@ -241,7 +276,8 @@ function renderRows() {
   if (!data) return;
   const needle = document.getElementById("filter").value.trim().toLowerCase();
   const rows = data.devices.filter(r =>
-    !needle || `${r.name} ${r.product ?? ""} ${r.unit}`.toLowerCase().includes(needle));
+    !needle || `${r.name} ${r.product ?? ""} ${r.unit} ${r.pim ? `pim ${r.pim}` : ""}`
+      .toLowerCase().includes(needle));
   rows.sort((a, b) => {
     const x = sortValue(a, sort.key), y = sortValue(b, sort.key);
     if (x === y) return a.unit - b.unit;
@@ -253,18 +289,28 @@ function renderRows() {
   const focused = document.activeElement?.dataset?.unit;
   document.getElementById("rows").replaceChildren(...rows.map(row => {
     const tr = el("tr");
-    for (const [key] of COLUMNS) {
+    for (const [key] of columns()) {
       let td;
       if (key === "name") {
-        td = el("td", undefined, "name");
+        td = el("td", undefined, row.pim ? `name pim-${row.pim}` : "name");
         const label = el("div", row.name);
         if (row.product) label.append(el("small", row.product));
         const device = el("div", undefined, "device");
         device.append(readButton(row), label);
         td.append(device);
       } else if (key === "level") {
-        const text = levelText(row.level);
-        td = el("td", text ?? "—", text ? "" : "none");
+        td = levelCell(row.level, row.dimmable);
+      } else if (key === "pim") {
+        td = el("td");
+        if (row.pim) {
+          const repeat = row.tx_count > 1;
+          const chip = el("span", `PIM ${row.pim}${repeat ? ` ×${row.tx_count}` : ""}`,
+                          `chip pim-${row.pim}${repeat ? " repeat" : ""}`);
+          chip.title = row.tx_count > 1
+            ? `Sent twice from PIM ${row.pim}: no PIM reaches it with one transmission`
+            : `PIM ${row.pim} reaches it with one transmission`;
+          td.append(chip);
+        }
       } else if (key === "last_heard") {
         td = el("td", row.last_heard ? ago(row.last_heard) : "never", row.last_heard ? "" : "none");
         if (row.last_heard) td.title = new Date(row.last_heard).toLocaleString();
@@ -280,16 +326,43 @@ function renderRows() {
   if (focused) document.querySelector(`button.read[data-unit="${focused}"]`)?.focus();
 
   const totals = document.getElementById("totals");
-  totals.replaceChildren(...COLUMNS.map(([key], i) => {
+  totals.replaceChildren(...columns().map(([key], i) => {
     if (i === 0) return el("td", `${rows.length} of ${data.devices.length} devices`);
+    if (key === "pim") return pimCounts(rows);
     return el("td", SUMMED.includes(key) ? rows.reduce((sum, r) => sum + r[key], 0) : "");
   }));
 }
 
+// Devices per PIM, each with its colour dot
+function pimCounts(rows) {
+  const td = el("td", undefined, "counts");
+  (data.pims ?? []).forEach((_, i) => {
+    const name = PIM_NAMES[i];
+    const count = el("span", undefined, `pim-${name}`);
+    count.title = `Devices PIM ${name} sends to`;
+    count.append(el("span", undefined, "dot"), `${rows.filter(r => r.pim === name).length}`);
+    td.append(count);
+  });
+  return td;
+}
+
+// One pill per PIM: its colour (the legend for the rows), whether it's
+// connected, and how many devices it sends to
 function renderStatus() {
-  const pim = document.getElementById("pim");
-  pim.textContent = data.pim_connected ? "PIM connected" : "PIM disconnected";
-  pim.className = `pill ${data.pim_connected ? "on" : "off"}`;
+  const pims = data.pims ?? [data.pim_connected];
+  document.getElementById("pims").replaceChildren(...pims.map((up, i) => {
+    const pill = el("span", undefined, `pill ${up ? "on" : "off"}`);
+    if (pims.length === 1) {
+      pill.textContent = up ? "PIM connected" : "PIM disconnected";
+      return pill;
+    }
+    const name = PIM_NAMES[i];
+    const devices = data.devices.filter(r => r.pim === name).length;
+    pill.classList.add(`pim-${name}`);
+    pill.append(el("span", undefined, "dot"),
+                `PIM ${name} ${up ? "connected" : "disconnected"} · ${devices} devices`);
+    return pill;
+  }));
   document.getElementById("since").textContent =
     `Counting since ${new Date(data.since).toLocaleString()} · tx_count ${data.tx_count}`;
 }
@@ -306,6 +379,7 @@ async function load() {
     data = await response.json();
     document.getElementById("error").textContent = "";
     settleReads();
+    if (columns().map(([key]) => key).join() !== headKeys) renderHead();
     renderStatus();
     renderRows();
   } catch (err) {

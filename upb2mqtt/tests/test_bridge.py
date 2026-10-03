@@ -247,7 +247,7 @@ async def main() -> int:
                              lambda: h.attr("1_15_0", "tx_count") == 2 and h.attr("1_14_0", "tx_count") == 1, 8)
             h.check("vanity takes 1", h.attr("1_51_0", "tx_count") == 1, h.attr("1_51_0", "tx_count"))
             keypad_reads = [m for m in pim.received if m in (query(KEYPAD, 1), query(KEYPAD, 2))]
-            h.check("keypad read only by its probes", keypad_reads == [query(KEYPAD, 1)] * 2, keypad_reads)
+            h.check("keypad read only by its probe", keypad_reads == [query(KEYPAD, 1)], keypad_reads)
             await asyncio.sleep(0.5)
 
             # States published retained
@@ -275,6 +275,11 @@ async def main() -> int:
             h.check("signal sensors discovered", sorted(sensors) == ["noise_floor", "signal_strength"]
                     and all(v["entity_category"] == "diagnostic" and v["state_topic"] == "upb/pim/signal"
                             for v in sensors.values()), sensors)
+            noise = pim_components.get("noise_problem", {})
+            h.check("high-noise problem sensor discovered", noise.get("platform") == "binary_sensor"
+                    and noise.get("device_class") == "problem" and "state_class" not in noise
+                    and noise.get("state_topic") == "upb/pim/signal"
+                    and "value_json.noise_floor > 100" in noise.get("value_template", ""), noise)
 
             # Per-device stats sensor: startup reads counted, probe misses aren't timeouts
             stats14 = json.loads(h.topics["homeassistant/device/upb_1_14/config"])["components"]["stats"]
@@ -283,7 +288,7 @@ async def main() -> int:
                     and stats14["default_entity_id"] == "sensor.first_floor_office_main_state_changes",
                     stats14)
             await h.wait_for("stats: startup queries answered with a latency",
-                             lambda: h.stats(14).get("queries") == 2 and h.stats(14).get("latency_ms"), 3)
+                             lambda: h.stats(14).get("queries") == 1 and h.stats(14).get("latency_ms"), 3)
             h.check("stats: probe miss not a timeout", h.stats(15).get("queries") == 2
                     and h.stats(15).get("timeouts") == 0, h.stats(15))
             h.check("stats: tx_count", (h.stats(14).get("tx_count"), h.stats(15).get("tx_count")) == (1, 2),
@@ -439,7 +444,7 @@ async def main() -> int:
             await h.wait_for("... and its query retried with two",
                              lambda: pim.received == [query(51, 1), query(51, 2)], 2)
             await h.wait_for("stats: query answered on retry isn't a timeout",
-                             lambda: h.stats(51).get("queries") == 3 and h.stats(51).get("timeouts") == 0
+                             lambda: h.stats(51).get("queries") == 2 and h.stats(51).get("timeouts") == 0
                              and h.stats(51).get("tx_count") == 2, 2)
 
             # Device table page (HA ingress) and the JSON it reads
@@ -453,7 +458,9 @@ async def main() -> int:
             row = rows.get(51, {})
             h.check("table: stats, tx_count, level", table.get("pim_connected") is True
                     and row.get("name") == "Master Bathroom Vanity" and row.get("timeouts") == 0
-                    and row.get("tx_count") == 2 and row.get("level") == [100], row)
+                    and row.get("tx_count") == 2 and row.get("level") == [100]
+                    and row.get("dimmable") == [False], row)
+            h.check("table: dimmers marked", rows.get(14, {}).get("dimmable") == [True], rows.get(14))
             pim.received.clear()
             code = (await http_get("/refresh/14", "POST"))[0]
             await asyncio.sleep(0.3)

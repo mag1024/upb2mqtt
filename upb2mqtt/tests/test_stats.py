@@ -58,7 +58,7 @@ def main() -> int:
     check("latency", d["latency_ms"], 800)
     check("reply isn't observed traffic", d["observed"], 0)
     check("last heard", d["last_heard"], "2023-11-14T22:13:20+00:00")
-    check("pending cleared", stats.pending, None)
+    check("pending cleared", stats.pending, {})
 
     stats.accepted(14)
     now[0] += 1.2
@@ -82,19 +82,29 @@ def main() -> int:
     stats.accepted(15)
     stats.heard(from_device(51, 0xFF, 0x86, [100]))
     check("other device's report observed", stats[51].observed, 2)
-    check("still pending", stats.pending is not None, True)
+    check("still pending", 15 in stats.pending, True)
 
     # Timeouts
     stats.timed_out(15, retrying=True)
     check("missed attempt that's resent isn't a timeout", stats[15].timeouts, 0)
-    check("timeout clears pending", stats.pending, None)
+    check("timeout clears pending", stats.pending, {})
     stats.timed_out(15, retrying=False)
     check("retry missed too -> one timeout", stats[15].timeouts, 1)
     stats.timed_out(15, retrying=False, probe=True)
     check("probe miss not counted", stats[15].timeouts, 1)
     stats.accepted(15)
     stats.disconnected()
-    check("disconnect clears pending", stats.pending, None)
+    check("disconnect clears pending", stats.pending, {})
+
+    # Queries in flight on both PIMs at once each get their latency
+    stats.accepted(14)
+    now[0] += 0.1
+    stats.accepted(15)
+    now[0] += 0.5
+    stats.heard(from_device(15, 0xFF, 0x86, [0]))
+    stats.heard(from_device(14, 0xFF, 0x86, [0]))
+    check("two pending queries", (stats[14].as_dict()["latency_ms"], stats[15].as_dict()["latency_ms"]),
+          (600, 500))
 
     check("no latency yet", stats[51].as_dict()["latency_ms"], None)
 

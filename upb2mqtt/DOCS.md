@@ -15,6 +15,7 @@ transmission; see [Transmit count](#transmit-count)).
 | Option | Description |
 | --- | --- |
 | `pim_url` | Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
+| `pim_b_url` | Optional second PIM (PIM B), on the other powerline phase; `pim_url` is then PIM A. See [Two PIMs](#two-pims). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
 | `tx_count` | Send each UPB message this many times: `1`, `2`, or `auto` (default). See [Transmit count](#transmit-count). Overrides `tx_count` in the UPE file. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
@@ -59,6 +60,7 @@ works as is.
   | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*, `refresh_hours`) and on *Refresh state*. |
   | `last_heard` | When the device last sent anything. |
   | `tx_count` | Transmit count in use for the device. |
+  | `pim` | With two PIMs: the one that sends to it (A or B). |
 
   Counts start again at 0 when the add-on restarts. The sensor is
   `total_increasing`, so Home Assistant's statistics carry on across that.
@@ -70,10 +72,16 @@ works as is.
   - *Noise floor*: powerline noise over the last 128 AC half-cycles, with
     the raw counts behind it as the `noise_counts` attribute.
 
+  - *High noise*: a problem binary sensor, on while the noise floor is
+    above 100.
+
   Both are raw PIM values (0–255, higher is stronger/noisier); PCS doesn't
   document their units. Reading them doesn't put anything on the powerline.
 
-Entities become unavailable when the add-on or the PIM is disconnected.
+Entities become unavailable when the add-on or the PIM is disconnected
+(with two PIMs, when both are). With two PIMs, the PIM device is named
+**UPB PIM A**, and PIM B gets its own **UPB PIM B** device with the same
+sensors.
 
 ## Device table
 
@@ -106,10 +114,11 @@ a single transmission each time it reads all devices: when it connects to the
 PIM, on *Refresh device states*, and every `refresh_hours`. Nothing is kept
 across restarts, since devices or the PIM may have moved.
 
-- It queries each device with a single transmission, twice. A device that
-  answers both takes 1 transmission; the reply also gives its state. One that
-  misses either (1.5 s timeout; replies take under 1 s) takes 2 and is read
-  again that way.
+- It queries each device once with a single transmission. A device that
+  answers takes 1 transmission; the reply also gives its state. One that
+  misses it (1.5 s timeout; replies take under 1 s) takes 2 and is read
+  again that way. Whether a device hears a single transmission follows the
+  leg (phase) it's on, so one answer is enough.
 - Each query waits for the PIM's queue to be idle, so a light command waits
   behind at most one of them. Until a device has been queried, it gets 2.
 - A scene (link) command goes out twice if any device in the scene, or any
@@ -120,10 +129,44 @@ across restarts, since devices or the PIM may have moved.
   light's attributes include its `tx_count`.
 
 A full read of about 65 devices with half of them on the far phase takes about
-2.5 minutes, against about 1.5 minutes when every query is sent twice; after
+2 minutes, against about 1.5 minutes when every query is sent twice; after
 that, every query and command to a near-phase device is faster. A light
 command gets no reply, so a device that misses one isn't noticed until it
 misses a query. Set `tx_count: 2` if that matters more.
+
+## Two PIMs
+
+With a PIM on each leg (phase) of a split-phase house, set `pim_b_url` to the
+second. Between them, the two PIMs reach almost every device with a single
+transmission. Both are assumed to reach every device with two.
+
+- Only one PIM transmits at a time. Every message waits until neither PIM
+  has one in flight, the last one has finished (the PIM reports it), and
+  any further copies of a message just heard have passed. The two PIMs
+  together send no faster than one; what they save is repeats.
+- With `tx_count: auto`, a full read queries each device once from PIM A.
+  A device that doesn't answer is queried once from PIM B. If that fails
+  too, it's read from PIM A with two transmissions. A device on PIM A's leg
+  is never queried from PIM B, and nothing PIM B answers is sent twice.
+- The first read after the add-on starts waits up to 10 s for both PIMs to
+  connect, so it doesn't send repeats to devices PIM B would reach once.
+- Each message goes out on the connected PIM that reaches it with the fewest
+  transmissions, PIM A on a tie. For a scene, that counts every device in
+  it and every keypad showing it, so a scene with devices on both legs goes
+  out twice from PIM A.
+- If one PIM disconnects, everything goes through the other, twice except to
+  devices it reaches once. When PIM B connects again, it's tried (once
+  each) only for the devices PIM A doesn't reach once; nothing else is
+  read.
+- A message sent twice crosses to the other phase, so both PIMs hear it:
+  each other's repeated messages, and a far device's repeated ones. A copy
+  heard on both within a second, or one PIM's own message heard by the
+  other, is handled once, so a scene fires one event. A message sent once
+  stays on its phase and is never taken for a copy.
+- Each light's attributes, its *State changes* sensor and the device table
+  show the PIM (`pim`: A or B) beside its `tx_count`.
+- With `tx_count: 1` or `2`, everything goes through PIM A and PIM B is a
+  standby, used only while PIM A is disconnected.
 
 ## Keypad LEDs
 

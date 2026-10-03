@@ -67,7 +67,8 @@ class Stats:
         self.wall = wall
         self.devices: dict[int, DeviceStats] = {}
         self.link_members: dict[int, set[int]] = {}  # link id -> upb ids that hear it
-        self.pending: tuple[int, float] | None = None  # queried upb id, when accepted
+        # Queries awaiting a reply (one per PIM at most): upb id -> when accepted
+        self.pending: dict[int, float] = {}
         self.started = wall()
 
     def __getitem__(self, upb_id: int) -> DeviceStats:
@@ -85,26 +86,23 @@ class Stats:
 
     def accepted(self, upb_id: int) -> None:
         """The PIM accepted a query to the device and is waiting for its reply."""
-        self.pending = (upb_id, self.clock())
+        self.pending[upb_id] = self.clock()
 
     def timed_out(self, upb_id: int, retrying: bool, probe: bool = False) -> None:
         """An attempt at a query went unanswered; upb-lib may send it again."""
-        if self.pending and self.pending[0] == upb_id:
-            self.pending = None
+        self.pending.pop(upb_id, None)
         if not retrying and not probe:
             self[upb_id].timeouts += 1
 
     def disconnected(self) -> None:
-        self.pending = None
+        self.pending.clear()
 
     def heard(self, msg) -> None:
         """A UPB message heard on the powerline (repeats already dropped)."""
         if msg.src_id != PIM_ID:
             self[msg.src_id].last_heard = self.wall()
-        if (not msg.link and msg.msg_id == STATE_REPORT and self.pending
-                and self.pending[0] == msg.src_id):
-            self[msg.src_id].latency = self.clock() - self.pending[1]
-            self.pending = None
+        if not msg.link and msg.msg_id == STATE_REPORT and msg.src_id in self.pending:
+            self[msg.src_id].latency = self.clock() - self.pending.pop(msg.src_id)
             return
         affected = {msg.src_id}
         if msg.link:
