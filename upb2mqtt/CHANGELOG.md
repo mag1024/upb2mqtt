@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1
+
+- Configuration: the PIM options are labelled *Primary PIM (A)* and
+  *Secondary PIM (B), optional*.
+
 ## 0.7.0
 
 - Optional second PIM (`pim_b_url`), for a PIM on each powerline leg. With
