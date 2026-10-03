@@ -43,7 +43,7 @@ Compared with Home Assistant's built-in UPB integration:
 ## Install
 
 Settings → Apps → App store → ⋮ → Repositories, add
-`https://gitea.ctl.luminal.org/mag/upb2mqtt`, then install **upb2mqtt**.
+`https://github.com/mag1024/upb2mqtt`, then install **upb2mqtt**.
 
 See [upb2mqtt/DOCS.md](upb2mqtt/DOCS.md) for configuration, entities, and
 migrating from the UPB integration.

@@ -2,7 +2,7 @@ name: upb2mqtt
 version: "0.8.2"
 slug: upb2mqtt
 description: Universal Powerline Bus (UPB) PIM to MQTT, with Home Assistant discovery
-url: https://gitea.ctl.luminal.org/mag/upb2mqtt
+url: https://github.com/mag1024/upb2mqtt
 arch:
   - aarch64
   - amd64
