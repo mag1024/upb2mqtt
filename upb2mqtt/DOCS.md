@@ -53,7 +53,7 @@ works as is.
   | --- | --- |
   | `sent` | Commands the bridge sent to the device (not queries). |
   | `sent_scene` | Scene (link) commands the bridge sent that the device hears. |
-  | `queries` | State reads the bridge sent. A single-transmission probe the device didn't answer while all devices are read (it's on the other PIM's phase) doesn't count. |
+  | `queries` | State reads the bridge sent, including the single-transmission probes sent while all devices are read. With two PIMs, a device PIM B reaches gets 2 per read: PIM A's probe, which it doesn't hear, then PIM B's. |
   | `observed` | Traffic from anyone else that concerns the device: a scene it hears (a keypad press), a command to it, or something it sent itself (a local press). Its answers to our queries don't count. |
   | `timeouts` | Queries it never answered. An unanswered query is sent once more; only when that goes unanswered too does it count. Misses of the single-transmission probes (see [Transmit count](#transmit-count)) are expected and don't count. |
   | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*) and on *Refresh state*. |

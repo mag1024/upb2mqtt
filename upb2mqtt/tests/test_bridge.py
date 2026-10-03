@@ -306,7 +306,7 @@ async def main() -> int:
                     stats14)
             await h.wait_for("stats: startup queries answered with a latency",
                              lambda: h.stats(14).get("queries") == 1 and h.stats(14).get("latency_ms"), 3)
-            h.check("stats: probe miss neither a query nor a timeout", h.stats(15).get("queries") == 1
+            h.check("stats: probe miss a query, not a timeout", h.stats(15).get("queries") == 2
                     and h.stats(15).get("timeouts") == 0, h.stats(15))
             h.check("stats: tx_count", (h.stats(14).get("tx_count"), h.stats(15).get("tx_count")) == (1, 2),
                     (h.stats(14), h.stats(15)))

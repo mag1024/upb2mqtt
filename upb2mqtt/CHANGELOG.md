@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2
+
+- *Queries* counts every state query again, including single-transmission
+  probes a device didn't answer (undoes that part of 0.8.1). With two PIMs,
+  a device PIM B reaches shows 2 per read of all devices: PIM A's probe,
+  which it doesn't hear, then PIM B's.
+
 ## 0.8.1
 
 - Device table: while all devices are being read (at startup, on *Refresh

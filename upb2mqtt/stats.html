@@ -133,7 +133,8 @@ const COLUMNS = [
   ["state_changes", "Changes", "Times its lights changed state"],
   ["sent", "Sent", "Commands the bridge sent to it"],
   ["sent_scene", "Scene", "Scene (link) commands the bridge sent that it hears"],
-  ["queries", "Queries", "State reads the bridge sent (not discovery probes it didn't answer)"],
+  ["queries", "Queries", "State reads the bridge sent, discovery probes included " +
+                "(a device PIM B reaches gets 2 per read: PIM A's probe misses it)"],
   ["observed", "Observed", "Traffic from anyone else: keypad and local presses, other controllers"],
   ["timeouts", "Timeouts", "Queries it never answered, retry included"],
   ["latency_ms", "Latency", "Reply time of the last state query (ms), from the PIM accepting it"],

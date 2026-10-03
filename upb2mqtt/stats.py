@@ -5,8 +5,8 @@ bridge started; nothing is persisted, so a restart starts every count at 0
 again (Home Assistant's total_increasing sensors expect exactly that).
 
 - sent / sent_scene / queries: messages the bridge sent to the device
-  directly, links it sent that the device hears, and state queries (not
-  tx_count probes it didn't answer).
+  directly, links it sent that the device hears, and state queries
+  (tx_count probes included, answered or not).
 - observed: powerline traffic from anyone else that concerns the device: a
   link it hears, a message to it, or a message it sent itself (a local
   press), other than its reply to our query.
@@ -92,11 +92,9 @@ class Stats:
     def timed_out(self, upb_id: int, retrying: bool, probe: bool = False) -> None:
         """An attempt at a query went unanswered; upb-lib may send it again.
         A tx_count probe that goes unanswered (the device is on the far
-        phase from that PIM) counts as neither a query nor a timeout."""
+        phase from that PIM) isn't a timeout, but stays a query."""
         self.pending.pop(upb_id, None)
-        if probe:
-            self[upb_id].queries -= 1
-        elif not retrying:
+        if not retrying and not probe:
             self[upb_id].timeouts += 1
 
     def disconnected(self) -> None:

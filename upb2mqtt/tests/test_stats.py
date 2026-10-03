@@ -93,7 +93,7 @@ def main() -> int:
     queries = stats[15].queries
     stats.timed_out(15, retrying=False, probe=True)
     check("probe miss not counted", stats[15].timeouts, 1)
-    check("probe miss not a query either", stats[15].queries, queries - 1)
+    check("... but it was a query", stats[15].queries, queries)
     stats.accepted(15)
     stats.disconnected()
     check("disconnect clears pending", stats.pending, {})

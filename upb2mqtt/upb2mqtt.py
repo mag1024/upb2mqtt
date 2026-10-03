@@ -66,7 +66,7 @@ from stats import Stats
 from txcount import TxCounts, TxEncoder
 import web
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 PIM_NAMES = "AB"  # the first PIM (pim_url) and the second (pim_b_url)
 LOG = logging.getLogger("upb2mqtt")
 
