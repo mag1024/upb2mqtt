@@ -1,16 +1,18 @@
 configuration:
   pim_url:
-    name: PIM
+    name: Primary PIM (A)
     description: >-
       Serial device (e.g. /dev/serial/by-id/usb-...) or network URL
-      (socket://host:port) of the UPB PIM (PIM A, if there are two).
+      (socket://host:port) of the UPB PIM. Required. Devices are tried from
+      this PIM first.
   pim_b_url:
-    name: PIM B
+    name: Secondary PIM (B), optional
     description: >-
-      Optional second PIM, on the other powerline phase (leg) from the first.
-      With tx_count auto, each message goes out on whichever PIM reaches its
-      devices with fewer transmissions; either PIM keeps UPB working while
-      the other is disconnected. Leave empty for one PIM.
+      Optional. A second PIM on the other powerline phase (leg) from the
+      primary, as a serial device or socket://host:port. With tx_count auto,
+      each message goes out on whichever PIM reaches its devices with fewer
+      transmissions; either PIM keeps UPB working while the other is
+      disconnected. Leave empty for one PIM.
   upe_file:
     name: UPStart export file
     description: Path to the UPStart .upe export. The HA config folder is at /homeassistant.

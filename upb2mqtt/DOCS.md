@@ -14,8 +14,8 @@ transmission; see [Transmit count](#transmit-count)).
 
 | Option | Description |
 | --- | --- |
-| `pim_url` | Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
-| `pim_b_url` | Optional second PIM (PIM B), on the other powerline phase; `pim_url` is then PIM A. See [Two PIMs](#two-pims). |
+| `pim_url` | **Primary PIM (A)**, required. Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
+| `pim_b_url` | **Secondary PIM (B)**, optional: a second PIM on the other powerline phase. Leave it unset for one PIM. See [Two PIMs](#two-pims). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
 | `tx_count` | Send each UPB message this many times: `1`, `2`, or `auto` (default). See [Transmit count](#transmit-count). Overrides `tx_count` in the UPE file. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
@@ -136,9 +136,10 @@ misses a query. Set `tx_count: 2` if that matters more.
 
 ## Two PIMs
 
-With a PIM on each leg (phase) of a split-phase house, set `pim_b_url` to the
-second. Between them, the two PIMs reach almost every device with a single
-transmission. Both are assumed to reach every device with two.
+With a PIM on each leg (phase) of a split-phase house, `pim_url` is the
+primary PIM (A) and the optional `pim_b_url` is the secondary (B). Between
+them, the two PIMs reach almost every device with a single transmission.
+Both are assumed to reach every device with two.
 
 - Only one PIM transmits at a time. Every message waits until neither PIM
   has one in flight, the last one has finished (the PIM reports it), and
