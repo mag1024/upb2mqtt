@@ -241,6 +241,23 @@ async def main() -> int:
             collector = asyncio.create_task(h.collect())
             await asyncio.sleep(1)
 
+            # The table shows the startup read's progress while it runs
+            progress = []
+            for _ in range(40):
+                try:
+                    status = json.loads((await http_get("/stats.json"))[2])
+                except OSError:
+                    status = {}
+                if status.get("reading"):
+                    progress.append(status["reading"])
+                elif progress:
+                    break
+                await asyncio.sleep(0.1)
+            h.check("table: read progress shown", bool(progress) and progress[0]["total"] == 4
+                    and any(p["unit"] == 15 for p in progress) and progress[-1]["done"] >= 3,
+                    progress[:1] + progress[-1:])
+            h.check("table: progress gone once read", status.get("reading") is None, status.get("reading"))
+
             # Startup: every device read with a single transmission first; 15
             # misses it (a 1.5 s timeout) and is read again with two
             await h.wait_for("transmit counts learned",
@@ -289,7 +306,7 @@ async def main() -> int:
                     stats14)
             await h.wait_for("stats: startup queries answered with a latency",
                              lambda: h.stats(14).get("queries") == 1 and h.stats(14).get("latency_ms"), 3)
-            h.check("stats: probe miss not a timeout", h.stats(15).get("queries") == 2
+            h.check("stats: probe miss neither a query nor a timeout", h.stats(15).get("queries") == 1
                     and h.stats(15).get("timeouts") == 0, h.stats(15))
             h.check("stats: tx_count", (h.stats(14).get("tx_count"), h.stats(15).get("tx_count")) == (1, 2),
                     (h.stats(14), h.stats(15)))

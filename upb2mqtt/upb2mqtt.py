@@ -66,7 +66,7 @@ from stats import Stats
 from txcount import TxCounts, TxEncoder
 import web
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 PIM_NAMES = "AB"  # the first PIM (pim_url) and the second (pim_b_url)
 LOG = logging.getLogger("upb2mqtt")
 
@@ -193,6 +193,8 @@ class Bridge:
         self.tx_probing: tuple[int, int, asyncio.Future[bool]] | None = None  # upb id, PIM
         self.tx_task: asyncio.Task[None] | None = None
         self.tx_full = False  # tx_task reads every device (else only PIM B's)
+        # While tx_task runs: devices done and to do, for the device table
+        self.read_progress: dict[str, Any] | None = None
 
     # ---- topics ----------------------------------------------------------
 
@@ -562,11 +564,24 @@ class Bridge:
             return first.name.rsplit(" ", 1)[0]
         return first.name
 
+    def _reading(self) -> dict[str, Any] | None:
+        """A read of all devices (or of PIM B's) in progress: devices done
+        of total, and the one being queried now, from which PIM."""
+        if not self.read_progress:
+            return None
+        probing = self.tx_probing
+        return {
+            **self.read_progress,
+            "unit": probing[0] if probing else None,
+            "pim": PIM_NAMES[probing[1]] if probing and self.second else None,
+        }
+
     def status(self) -> dict[str, Any]:
         """Everything the device table shows (web.py)."""
         return {
             "pim_connected": self._online(),
             "pims": [connection.is_connected() for connection in self.conns],
+            "reading": self._reading(),
             "since": datetime.fromtimestamp(self.stats.started, timezone.utc).isoformat(),
             "tx_count": str(self.opts.tx_count),
             "devices": [
@@ -695,6 +710,7 @@ class Bridge:
         if self.tx_task:
             self.tx_task.cancel()
             self.tx_task = None
+        self.read_progress = None
 
     def _probe_order(self) -> list[int]:
         # Lights first: keypad LEDs are compared with the lights' states once
@@ -706,13 +722,17 @@ class Bridge:
         and from which PIM: the first, else the second; else the first sends
         it repeated."""
         started = asyncio.get_running_loop().time()
+        order = self._probe_order()
+        self.read_progress = {"done": 0, "total": len(order), "waiting": True}
         await self._await_pims()
+        self.read_progress["waiting"] = False
         LOG.info("Reading %d devices, single transmission first", len(self.tx_names))
         lights = {d.addr.upb_id for d in self.pim.devices.elements.values()}
-        for upb_id in self._probe_order():
+        for upb_id in order:
             if await self._learn(upb_id, range(len(self.conns))) is None \
                     and (upb_id in lights or upb_id in self.keypads):
                 self._query(upb_id)  # read again, at the repeat count
+            self.read_progress["done"] += 1
         # PIM B if it connected since this started, for the devices it missed
         await self._probe_second()
         await self._learned(started)
@@ -732,14 +752,18 @@ class Bridge:
         already, so one that doesn't answer isn't read again."""
         if not self.second:
             return
-        for upb_id in self._probe_order():
-            if not self.tx.single[0].get(upb_id) and upb_id not in self.tx.single[1]:
-                await self._learn(upb_id, [1])
+        todo = [upb_id for upb_id in self._probe_order()
+                if not self.tx.single[0].get(upb_id) and upb_id not in self.tx.single[1]]
+        self.read_progress["total"] += len(todo)
+        for upb_id in todo:
+            await self._learn(upb_id, [1])
+            self.read_progress["done"] += 1
 
     async def _probe_second_pass(self) -> None:
         """PIM B connected after the last full read: learn just its devices."""
         started = asyncio.get_running_loop().time()
         LOG.info("PIM B connected; trying it for devices PIM A doesn't reach once")
+        self.read_progress = {"done": 0, "total": 0, "waiting": False}
         await self._probe_second()
         await self._learned(started)
 
@@ -758,6 +782,7 @@ class Bridge:
     async def _learned(self, started: float) -> None:
         await self._pim_idle()  # the last reads answered
         self.tx_task = None
+        self.read_progress = None
         for upb_id in self.keypads:
             self._schedule_keypad(upb_id)
         self._publish_device_attributes()

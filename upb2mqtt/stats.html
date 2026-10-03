@@ -84,6 +84,17 @@
   button.read.fail { color: var(--bad); }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) { button.read.busy svg { animation: none; } }
+  /* A read of all devices in progress */
+  .progress { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .progress[hidden] { display: none; }
+  .progress .bar { width: 120px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  .progress .bar span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+  .pill.querying .dot { animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.2; } }
+  @media (prefers-reduced-motion: reduce) {
+    .pill.querying .dot { animation: none; }
+    .progress .bar span { transition: none; }
+  }
   .none { color: var(--muted); }
   .lit { color: var(--lit); font-weight: 500; }
   td.warn { color: var(--bad); background: var(--warn-bg); font-weight: 500; }
@@ -95,6 +106,11 @@
 <header>
   <h1>UPB devices</h1>
   <span id="pims" class="pims"><span class="pill">…</span></span>
+  <span id="progress" class="progress" hidden
+        title="Each device is queried with one transmission first, to learn which PIM reaches it">
+    <span id="progress-text"></span>
+    <span class="bar" role="progressbar" aria-label="Devices read"><span id="progress-bar"></span></span>
+  </span>
   <span id="since" class="meta"></span>
   <span id="error" class="meta"></span>
   <span class="spacer"></span>
@@ -117,7 +133,7 @@ const COLUMNS = [
   ["state_changes", "Changes", "Times its lights changed state"],
   ["sent", "Sent", "Commands the bridge sent to it"],
   ["sent_scene", "Scene", "Scene (link) commands the bridge sent that it hears"],
-  ["queries", "Queries", "State reads the bridge sent"],
+  ["queries", "Queries", "State reads the bridge sent (not discovery probes it didn't answer)"],
   ["observed", "Observed", "Traffic from anyone else: keypad and local presses, other controllers"],
   ["timeouts", "Timeouts", "Queries it never answered, retry included"],
   ["latency_ms", "Latency", "Reply time of the last state query (ms), from the PIM accepting it"],
@@ -182,7 +198,10 @@ function readButton(row) {
   button.type = "button";
   button.dataset.unit = row.unit;
   const outcome = outcomes.get(row.unit);
-  if (reading.has(row.unit)) {
+  if (data.reading?.unit === row.unit) {
+    button.classList.add("busy");
+    button.title = "Being read now (reading all devices)";
+  } else if (reading.has(row.unit)) {
     button.classList.add("busy");
     button.title = "Reading…";
   } else if (outcome) {
@@ -346,9 +365,27 @@ function pimCounts(rows) {
   return td;
 }
 
+// A read of all devices: how far it's got, and the device being queried
+function renderProgress() {
+  const r = data.reading;
+  const progress = document.getElementById("progress");
+  progress.hidden = !r;
+  if (!r) return;
+  const now = r.unit == null ? "" : ` · unit ${r.unit}${r.pim ? ` via PIM ${r.pim}` : ""}`;
+  document.getElementById("progress-text").textContent = r.waiting
+    ? "Waiting for the PIMs to connect before reading devices"
+    : `Reading devices ${r.done} of ${r.total}${now}`;
+  const bar = document.getElementById("progress-bar");
+  bar.style.width = `${r.total ? (100 * r.done) / r.total : 0}%`;
+  bar.parentElement.setAttribute("aria-valuenow", r.done);
+  bar.parentElement.setAttribute("aria-valuemax", r.total);
+}
+
 // One pill per PIM: its colour (the legend for the rows), whether it's
-// connected, and how many devices it sends to
+// connected, and how many devices it sends to; its dot pulses while it
+// queries a device for a read of all devices
 function renderStatus() {
+  renderProgress();
   const pims = data.pims ?? [data.pim_connected];
   document.getElementById("pims").replaceChildren(...pims.map((up, i) => {
     const pill = el("span", undefined, `pill ${up ? "on" : "off"}`);
@@ -359,6 +396,7 @@ function renderStatus() {
     const name = PIM_NAMES[i];
     const devices = data.devices.filter(r => r.pim === name).length;
     pill.classList.add(`pim-${name}`);
+    if (data.reading?.pim === name) pill.classList.add("querying");
     pill.append(el("span", undefined, "dot"),
                 `PIM ${name} ${up ? "connected" : "disconnected"} · ${devices} devices`);
     return pill;
@@ -385,7 +423,7 @@ async function load() {
   } catch (err) {
     document.getElementById("error").textContent = `Can't reach the add-on (${err.message})`;
   } finally {
-    schedule(reading.size ? FAST_REFRESH_MS : REFRESH_MS);
+    schedule(reading.size || data?.reading ? FAST_REFRESH_MS : REFRESH_MS);
   }
 }
 

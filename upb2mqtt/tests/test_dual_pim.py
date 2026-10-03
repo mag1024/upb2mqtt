@@ -245,6 +245,9 @@ async def main() -> int:
                                          h.topics.get("upb/powerline/status")) == ("online",) * 3)
             h.check("stats carry the PIM", (h.stats(14).get("pim"), h.stats(14).get("tx_count")) == ("B", 1),
                     h.stats(14))
+            await h.wait_for("one query each, wherever reached (missed probes not counted)",
+                             lambda: [h.stats(u).get("queries") for u in (14, 15, 51)] == [1, 1, 1], 3,
+                             lambda: [h.stats(u).get("queries") for u in (14, 15, 51)])
 
             # Discovery: a second PIM device; lights available while either PIM is
             pim_b_config = json.loads(h.topics.get("homeassistant/device/upb_1_pim_b/config", "{}"))

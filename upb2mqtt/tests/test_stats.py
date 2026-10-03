@@ -90,8 +90,10 @@ def main() -> int:
     check("timeout clears pending", stats.pending, {})
     stats.timed_out(15, retrying=False)
     check("retry missed too -> one timeout", stats[15].timeouts, 1)
+    queries = stats[15].queries
     stats.timed_out(15, retrying=False, probe=True)
     check("probe miss not counted", stats[15].timeouts, 1)
+    check("probe miss not a query either", stats[15].queries, queries - 1)
     stats.accepted(15)
     stats.disconnected()
     check("disconnect clears pending", stats.pending, {})

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1
+
+- Device table: while all devices are being read (at startup, on *Refresh
+  device states*, or PIM B reconnecting), the header shows how far it's got
+  and which device is being queried from which PIM; that PIM's dot pulses
+  and the device's refresh icon spins.
+- *Queries* no longer counts a single-transmission probe a device didn't
+  answer while all devices were read (one sent from the PIM on the other
+  phase), so a device reached by PIM B shows 1, not 2.
+
 ## 0.8.0
 
 - Removed the `refresh_hours` option and the periodic re-read of all
