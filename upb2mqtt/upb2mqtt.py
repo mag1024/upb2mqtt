@@ -66,7 +66,7 @@ from stats import Stats
 from txcount import TxCounts, TxEncoder
 import web
 
-VERSION = "0.7.2"
+VERSION = "0.8.0"
 PIM_NAMES = "AB"  # the first PIM (pim_url) and the second (pim_b_url)
 LOG = logging.getLogger("upb2mqtt")
 
@@ -1372,16 +1372,6 @@ class Bridge:
             topic, payload, retain = await self.outbox.get()
             await client.publish(topic, payload, qos=1, retain=retain)
 
-    async def run_refresh(self) -> None:
-        """Optional periodic resync, to correct drift from untracked changes."""
-        if self.opts.refresh_hours <= 0:
-            return
-        while True:
-            await asyncio.sleep(self.opts.refresh_hours * 3600)
-            if self._online():
-                LOG.info("Periodic device state refresh")
-                self._read_all()
-
 
 def supervisor_get(path: str) -> dict[str, Any]:
     """GET from the Supervisor API; raises if there's none (not an add-on)."""
@@ -1426,13 +1416,12 @@ def parse_args() -> argparse.Namespace:
         "upe_file": "/homeassistant/network.upe",
         "topic_prefix": "upb",
         "discovery_prefix": "homeassistant",
-        "refresh_hours": 0,
         "keypad_sync": True,
         "keypad_scene_match": "all",
         "keypad_delay": 1.5,
         "stats_interval": 60,
         "web_port": 8099,  # config.yaml's ingress_port; 0 = no device table
-        "batch_window": 0.15,
+        "batch_window": 0.15,  # optional in config.yaml, so not listed there
         "tx_count": "auto",
         "mqtt_host": "",
         "mqtt_port": 1883,
@@ -1486,7 +1475,6 @@ async def main() -> None:
             if bridge.second:
                 group.create_task(bridge.second.connection.connect())
                 group.create_task(bridge.line.run())
-            group.create_task(bridge.run_refresh())
             group.create_task(bridge.run_signal())
             group.create_task(bridge.run_stats())
             group.create_task(bridge.run_web())

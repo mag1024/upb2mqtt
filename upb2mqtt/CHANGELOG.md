@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0
+
+- Removed the `refresh_hours` option and the periodic re-read of all
+  devices. *Refresh device states* and each device's *Refresh state* still
+  read devices on demand. A `refresh_hours` left in your configuration is
+  ignored.
+- `batch_window` is optional and no longer listed by default; it's under
+  "Show unused optional configuration options" and still 0.15 s when unset.
+
 ## 0.7.2
 
 - Configuration: *Secondary PIM (B), optional* is always listed (empty means

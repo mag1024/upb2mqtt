@@ -18,10 +18,9 @@ transmission; see [Transmit count](#transmit-count)).
 | `pim_b_url` | **Secondary PIM (B)**, optional: a second PIM on the other powerline phase. Leave it empty for one PIM. See [Two PIMs](#two-pims). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
 | `tx_count` | Send each UPB message this many times: `1`, `2`, or `auto` (default). See [Transmit count](#transmit-count). Overrides `tx_count` in the UPE file. |
-| `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
 | `keypad_sync` | Keep keypad LEDs in step with lights (default on). See [Keypad LEDs](#keypad-leds). |
 | `keypad_scene_match` | `all` (default) or `any`: when a multi-light scene counts as on for its LED. |
-| `batch_window` | Seconds to collect light commands before sending, default 0.15 (0 = off). See [Light groups](#light-groups). |
+| `batch_window` | Optional (under "Show unused optional configuration options"). Seconds to collect light commands before sending, default 0.15 (0 = off). See [Light groups](#light-groups). |
 | `topic_prefix` | Default `upb`. |
 | `discovery_prefix` | Default `homeassistant`. |
 | `mqtt_*` | Only needed if you don't use the Mosquitto add-on. |
@@ -57,7 +56,7 @@ works as is.
   | `queries` | State reads the bridge sent. |
   | `observed` | Traffic from anyone else that concerns the device: a scene it hears (a keypad press), a command to it, or something it sent itself (a local press). Its answers to our queries don't count. |
   | `timeouts` | Queries it never answered. An unanswered query is sent once more; only when that goes unanswered too does it count. Misses of the single-transmission probes (see [Transmit count](#transmit-count)) are expected and don't count. |
-  | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*, `refresh_hours`) and on *Refresh state*. |
+  | `latency_ms` | Time from the PIM accepting the last state query to the device's answer; time waiting in the queue doesn't count. Only queries are timed, so it's updated when all devices are read (start, *Refresh device states*) and on *Refresh state*. |
   | `last_heard` | When the device last sent anything. |
   | `tx_count` | Transmit count in use for the device. |
   | `pim` | With two PIMs: the one that sends to it (A or B). |
@@ -111,8 +110,8 @@ takes about 0.8 s instead of 1.4 s.
 
 With `tx_count: auto` (the default) the bridge learns which devices answer
 a single transmission each time it reads all devices: when it connects to the
-PIM, on *Refresh device states*, and every `refresh_hours`. Nothing is kept
-across restarts, since devices or the PIM may have moved.
+PIM, and on *Refresh device states*. Nothing is kept across restarts, since
+devices or the PIM may have moved.
 
 - It queries each device once with a single transmission. A device that
   answers takes 1 transmission; the reply also gives its state. One that
@@ -288,5 +287,5 @@ Requires Home Assistant 2025.10 or later (`default_entity_id` in discovery).
 This comes from upb-lib and behaves the same as in the integration.
 
 - When a link is activated, device levels are *assumed* from the link
-  table in the UPE file, not read back. `refresh_hours` or the *Refresh
-  device states* button corrects any drift.
+  table in the UPE file, not read back. The *Refresh device states* button
+  corrects any drift.

@@ -22,11 +22,6 @@ configuration:
       Send each UPB message this many times: 1, 2, or auto (learn which
       devices answer a single transmission and send 2 to the rest, and to any
       scene one of those is in). Overrides tx_count in the UPE file.
-  refresh_hours:
-    name: Refresh interval (hours)
-    description: >-
-      Re-read every device's state this often, to correct drift. 0 disables.
-      Commands queue behind a refresh (about 1.4 s per device).
   keypad_sync:
     name: Keypad LED sync
     description: >-
@@ -42,7 +37,7 @@ configuration:
     description: >-
       Hold light commands this long so that a light group's commands arrive
       together; where a scene sets exactly those lights, send the scene
-      instead. 0 disables.
+      instead. Default 0.15 when not set; 0 disables.
   topic_prefix:
     name: Topic prefix
   discovery_prefix:
