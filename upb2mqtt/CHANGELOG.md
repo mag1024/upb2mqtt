@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Configuration: *Secondary PIM (B), optional* is always listed (empty means
+  one PIM), not hidden under "Show unused optional configuration options".
+
 ## 0.7.1
 
 - Configuration: the PIM options are labelled *Primary PIM (A)* and

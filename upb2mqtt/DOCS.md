@@ -15,7 +15,7 @@ transmission; see [Transmit count](#transmit-count)).
 | Option | Description |
 | --- | --- |
 | `pim_url` | **Primary PIM (A)**, required. Serial device (`/dev/serial/by-id/usb-...`) or network PIM (`socket://10.0.5.3:2101`). |
-| `pim_b_url` | **Secondary PIM (B)**, optional: a second PIM on the other powerline phase. Leave it unset for one PIM. See [Two PIMs](#two-pims). |
+| `pim_b_url` | **Secondary PIM (B)**, optional: a second PIM on the other powerline phase. Leave it empty for one PIM. See [Two PIMs](#two-pims). |
 | `upe_file` | UPStart export. Your HA config folder is mounted read-only at `/homeassistant`. |
 | `tx_count` | Send each UPB message this many times: `1`, `2`, or `auto` (default). See [Transmit count](#transmit-count). Overrides `tx_count` in the UPE file. |
 | `refresh_hours` | Re-query all devices this often (0 = off). Commands wait behind a refresh. |
